@@ -62,7 +62,7 @@ pub fn landing(req: &Request, stream: &mut TcpStream, cfg: &Config) {
     <section class="copy">
       <p class="eyebrow">OpenAI endpoint. Codex OAuth upstream.</p>
       <h1>AkurAI Router</h1>
-      <p class="lead">A small Rust service that exposes `/v1/responses` and `/v1/models`, authenticates tools with a private API key, and routes requests through the Codex CLI OAuth identity on the VM.</p>
+      <p class="lead">A small Rust service that exposes `/v1/responses` and `/v1/models`, authenticates tools with a private API key, and routes requests through a secure server-side Codex CLI OAuth identity.</p>
       <div class="actions">
         <a class="button" href="/login">Log in with AkurAI IDP</a>
         <a class="button ghost" href="https://github.com/olibuijr/AkurAI-Router">Source</a>
@@ -143,8 +143,8 @@ pub fn admin(req: &Request, stream: &mut TcpStream, cfg: &Config) {
   <section class="panel">
     <h2>Login Setup</h2>
     <ol class="steps">
-      <li>SSH to the VM as `ubuntu` and run `codex login` when the Codex OAuth token needs renewal.</li>
-      <li>Keep `~/.codex/auth.json` readable only by the service account.</li>
+      <li>Refresh Codex OAuth with `codex login` for the configured service account when renewal is required.</li>
+      <li>Keep the configured Codex auth file readable only by the service account.</li>
       <li>Configure clients with base URL `{base}/v1`, wire API `responses`, and the router API key from `/etc/akurai-router/router.env`.</li>
     </ol>
   </section>
@@ -178,7 +178,7 @@ pub fn admin(req: &Request, stream: &mut TcpStream, cfg: &Config) {
         provider_hint = if auth_ok {
             "The router will use the Codex OAuth material at this path and refresh access tokens when possible."
         } else {
-            "Run codex login on the VM or set AKURAI_ROUTER_CODEX_AUTH_PATH to the correct auth.json path."
+            "Run codex login for the configured service account or set AKURAI_ROUTER_CODEX_AUTH_PATH to the correct auth.json path."
         },
         model_rows = model_rows,
     );
