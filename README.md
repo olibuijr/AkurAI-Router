@@ -3,12 +3,12 @@
 [![Rust](https://img.shields.io/badge/Rust-std--only-b7410e?logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![OpenAI compatible](https://img.shields.io/badge/API-OpenAI%20compatible-111827)](#api)
-[![Providers](https://img.shields.io/badge/Providers-Codex%20%2B%20Claude%20Code-2563eb)](#providers)
+[![Providers](https://img.shields.io/badge/Providers-Codex%20%2B%20Claude%20Code%20%2B%20OpenCode%20Go-2563eb)](#providers)
 
 AkurAI Router is a small OpenAI-compatible router for personal and team tooling.
 It exposes a private `/v1` endpoint, protects it with one server-side API key,
 and routes model calls through local OAuth credentials from Codex CLI and
-Claude Code.
+Claude Code, plus OpenCode Go subscription API keys.
 
 The project intentionally stays lean: one Rust binary, no Rust crate
 dependencies, local config files, and `curl` for outbound HTTPS because the Rust
@@ -20,6 +20,8 @@ standard library does not ship a TLS client.
 - OpenAI-compatible `POST /v1/chat/completions`
 - Codex Responses proxy via Codex CLI OAuth
 - Claude Code proxy via Claude Code OAuth and Anthropic Messages
+- OpenCode Go provider using OpenAI chat and Anthropic-style messages routes
+- Provider-prefixed model IDs such as `codex/gpt-5.4-mini`
 - Basic multimodal forwarding for OpenAI `image_url` content on Codex models
 - API-key protection for every `/v1/*` route
 - Browser admin panel protected by AkurAI IDP SSO
@@ -41,11 +43,14 @@ OpenAI-compatible client
         |
         | model owner = claude
         +--> Claude Code OAuth -> api.anthropic.com/v1/messages
+        |
+        | model owner = opencode-go
+        +--> OpenCode Go API key -> opencode.ai/zen/go/v1/*
 ```
 
-The model table records which provider owns each model. A request for
-`gpt-5.4-mini` routes to Codex. A request for `claude-opus-4-8` routes to
-Claude Code.
+The model table records which provider owns each model. The public model list
+uses provider prefixes: `codex/gpt-5.4-mini`, `claude/claude-opus-4-8`, and
+`opencode-go/glm-5.2`. Bare legacy IDs are still accepted for existing clients.
 
 ## API
 
@@ -66,7 +71,7 @@ curl "$AKURAI_ROUTER_BASE/v1/chat/completions" \
   -H "Authorization: Bearer $AKURAI_ROUTER_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "claude-opus-4-8",
+    "model": "opencode-go/glm-5.2",
     "messages": [
       { "role": "user", "content": "Reply with only OK." }
     ]
@@ -111,6 +116,33 @@ Known usable Claude Code defaults currently include:
 `404` through this Claude Code Messages path during verification, so the router
 filters it out of catalog syncs.
 
+### OpenCode Go
+
+OpenCode Go routing follows the 9Router OpenCode Go provider shape:
+
+- API key source: `~/.local/share/opencode/auth.json`
+- Chat upstream: `https://opencode.ai/zen/go/v1/chat/completions`
+- Messages upstream: `https://opencode.ai/zen/go/v1/messages`
+- GLM, Kimi, DeepSeek, and MiMo models use OpenAI-compatible chat with bearer auth
+- MiniMax and Qwen models use Anthropic-style messages with `x-api-key`
+
+Default OpenCode Go models include:
+
+- `glm-5.2`
+- `glm-5.1`
+- `kimi-k2.7-code`
+- `kimi-k2.6`
+- `deepseek-v4-pro`
+- `deepseek-v4-flash`
+- `mimo-v2.5`
+- `mimo-v2.5-pro`
+- `minimax-m3`
+- `minimax-m2.7`
+- `minimax-m2.5`
+- `qwen3.7-max`
+- `qwen3.7-plus`
+- `qwen3.6-plus`
+
 ## Quickstart
 
 Build the binary:
@@ -142,6 +174,7 @@ AKURAI_ROUTER_API_KEY=akr_...
 AKURAI_ROUTER_COOKIE_SECRET=...
 AKURAI_ROUTER_CODEX_AUTH_PATH=/home/you/.codex/auth.json
 AKURAI_ROUTER_CLAUDE_AUTH_PATH=/home/you/.claude/.credentials.json
+AKURAI_ROUTER_OPENCODE_GO_AUTH_PATH=/home/you/.local/share/opencode/auth.json
 AKURAI_ROUTER_DEFAULT_MODEL=gpt-5.4-mini
 AKURAI_ROUTER_IDP_ISSUER=https://auth.example.com
 AKURAI_ROUTER_IDP_CLIENT_ID=...
@@ -168,12 +201,14 @@ akurai-router key generate
 akurai-router providers list
 akurai-router providers add codex --auth-path ~/.codex/auth.json
 akurai-router providers add claude --auth-path ~/.claude/.credentials.json
+akurai-router providers add opencode-go --auth-path ~/.local/share/opencode/auth.json
 akurai-router providers enable codex
 akurai-router providers disable claude
 
 akurai-router models list
 akurai-router models add gpt-5.4-mini "GPT 5.4 Mini" gpt-5.4-mini codex
 akurai-router models add claude-opus-4-8 "Claude Opus 4.8" claude-opus-4-8 claude
+akurai-router models add glm-5.2 "GLM 5.2" glm-5.2 opencode-go
 akurai-router models remove claude-opus-4-8
 
 akurai-router idp client-json
@@ -191,6 +226,9 @@ Provider rows are stored as:
 ```text
 id|name|enabled|auth_path
 ```
+
+`/v1/models` returns provider-prefixed IDs. Store model rows with the bare
+provider-local ID unless you intentionally want a custom public alias.
 
 ## Admin Panel
 
@@ -236,8 +274,8 @@ TLS reverse proxy -> 127.0.0.1:4219 -> akurai-router -> provider OAuth upstreams
 - Do not expose `/v1/*` without `AKURAI_ROUTER_API_KEY`.
 - Do not commit `router.conf`, `/etc/akurai-router/router.env`, OAuth files, or
   copied credentials.
-- Keep `~/.codex/auth.json` and `~/.claude/.credentials.json` readable only by
-  the service account.
+- Keep `~/.codex/auth.json`, `~/.claude/.credentials.json`, and
+  `~/.local/share/opencode/auth.json` readable only by the service account.
 - Use HTTPS for public deployments.
 - Rotate the router API key if it is pasted into logs, chat, screenshots, or
   client-side code.

@@ -2,9 +2,14 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
-use crate::config::{Config, load_models, load_providers};
+use crate::config::{
+    Config, PROVIDER_CLAUDE, PROVIDER_CODEX, PROVIDER_OPENCODE_GO, canonical_provider_id,
+    default_provider_auth_path, is_opencode_go_messages_model, load_models, load_providers,
+    model_id_for_provider, public_model_id, split_model_provider_prefix,
+};
 use crate::http;
 use crate::json::{self, Json};
 use crate::util::{base64_url_decode, now_secs};
@@ -12,6 +17,8 @@ use crate::util::{base64_url_decode, now_secs};
 const DEFAULT_CODEX_INSTRUCTIONS: &str = "You are Codex, a focused software engineering agent. Answer accurately, preserve user intent, and use tools only when provided by the client.";
 const DEFAULT_CLAUDE_SYSTEM_PROMPT: &str =
     "You are Claude Code, Anthropic's official CLI for Claude.";
+const DEFAULT_OPENCODE_SYSTEM_PROMPT: &str =
+    "You are OpenCode Go, a focused coding assistant. Answer accurately and concisely.";
 const DEFAULT_CLAUDE_MAX_TOKENS: u64 = 64_000;
 
 #[derive(Clone, Debug)]
@@ -32,11 +39,16 @@ struct ClaudeAuth {
     access_token: String,
 }
 
+#[derive(Clone, Debug)]
+struct OpenCodeGoAuth {
+    api_key: String,
+}
+
 pub fn models_json(cfg: &Config) -> String {
     let mut data = Vec::new();
     for model in load_models(cfg).into_iter().filter(|m| m.enabled) {
         let mut obj = Json::object();
-        obj.set("id", Json::String(model.id));
+        obj.set("id", Json::String(public_model_id(&model)));
         obj.set("object", Json::String("model".to_string()));
         obj.set("owned_by", Json::String(model.provider_id));
         data.push(obj);
@@ -57,10 +69,10 @@ pub fn forward_model(req: &http::Request, stream: &mut TcpStream, cfg: &Config) 
         );
         return;
     }
-    if provider_id == "claude" {
-        forward_claude(req, stream, cfg);
-    } else {
-        forward_codex(req, stream, cfg);
+    match provider_id.as_str() {
+        PROVIDER_CLAUDE => forward_claude(req, stream, cfg),
+        PROVIDER_OPENCODE_GO => forward_opencode_go(req, stream, cfg),
+        _ => forward_codex(req, stream, cfg),
     }
 }
 
@@ -196,6 +208,120 @@ fn forward_claude(req: &http::Request, stream: &mut TcpStream, cfg: &Config) {
     }
 }
 
+fn forward_opencode_go(req: &http::Request, stream: &mut TcpStream, cfg: &Config) {
+    if !req.path.ends_with("/chat/completions") {
+        let _ = http::send_json(
+            stream,
+            400,
+            &error_json("opencode-go models support /v1/chat/completions"),
+        );
+        return;
+    }
+    let input = match json::parse(&String::from_utf8_lossy(&req.body)) {
+        Ok(value) => value,
+        Err(e) => {
+            let _ = http::send_json(stream, 400, &error_json(&e));
+            return;
+        }
+    };
+    let requested_model = input.get_str("model").unwrap_or("glm-5.2");
+    let upstream_model = resolve_model_id_for_provider(cfg, requested_model, PROVIDER_OPENCODE_GO);
+    if is_opencode_go_messages_model(&upstream_model) {
+        forward_opencode_go_messages(req, stream, cfg);
+        return;
+    }
+
+    let mut body = input;
+    body.set("model", Json::String(upstream_model));
+    let auth = match load_opencode_go_auth(cfg) {
+        Ok(a) => a,
+        Err(e) => {
+            let _ = http::send_json(stream, 502, &error_json(&e));
+            return;
+        }
+    };
+    let accept = if body.get_bool("stream").unwrap_or(false) {
+        "text/event-stream"
+    } else {
+        "application/json"
+    };
+    let headers = vec![
+        ("Content-Type".to_string(), "application/json".to_string()),
+        ("Accept".to_string(), accept.to_string()),
+        (
+            "Authorization".to_string(),
+            format!("Bearer {}", auth.api_key),
+        ),
+    ];
+    if let Err(e) = curl_stream_post(
+        &cfg.opencode_go_chat_url,
+        &headers,
+        body.stringify().as_bytes(),
+        stream,
+    ) {
+        let _ = http::send_json(stream, 502, &error_json(&e));
+    }
+}
+
+fn forward_opencode_go_messages(req: &http::Request, stream: &mut TcpStream, cfg: &Config) {
+    let body = match transform_anthropic_messages_request(
+        &req.body,
+        cfg,
+        PROVIDER_OPENCODE_GO,
+        DEFAULT_OPENCODE_SYSTEM_PROMPT,
+    ) {
+        Ok(body) => body,
+        Err(e) => {
+            let _ = http::send_json(stream, 400, &error_json(&e));
+            return;
+        }
+    };
+
+    let auth = match load_opencode_go_auth(cfg) {
+        Ok(a) => a,
+        Err(e) => {
+            let _ = http::send_json(stream, 502, &error_json(&e));
+            return;
+        }
+    };
+    let headers = vec![
+        ("Content-Type", "application/json".to_string()),
+        ("Accept", "application/json".to_string()),
+        ("x-api-key", auth.api_key),
+        ("anthropic-version", "2023-06-01".to_string()),
+    ];
+    match curl_capture(
+        "POST",
+        &cfg.opencode_go_messages_url,
+        &headers,
+        body.as_bytes(),
+        900,
+    ) {
+        Ok(resp) => {
+            if resp.status != 200 {
+                let _ = http::send_json(
+                    stream,
+                    resp.status,
+                    &error_json(&String::from_utf8_lossy(&resp.body)),
+                );
+                return;
+            }
+            let text = String::from_utf8_lossy(&resp.body);
+            match claude_to_openai_response(&text, cfg) {
+                Ok(json) => {
+                    let _ = http::send_json(stream, 200, &json);
+                }
+                Err(e) => {
+                    let _ = http::send_json(stream, 502, &error_json(&e));
+                }
+            }
+        }
+        Err(e) => {
+            let _ = http::send_json(stream, 502, &error_json(&e));
+        }
+    }
+}
+
 pub fn fetch_codex_models(cfg: &Config) -> Result<CurlResponse, String> {
     let auth = load_or_refresh_codex_auth(cfg)?;
     let mut headers = vec![
@@ -219,6 +345,15 @@ pub fn fetch_claude_models(cfg: &Config) -> Result<CurlResponse, String> {
         ("Anthropic-Beta", "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05,advanced-tool-use-2025-11-20,effort-2025-11-24,structured-outputs-2025-12-15,fast-mode-2026-02-01,redact-thinking-2026-02-12,token-efficient-tools-2026-03-28".to_string()),
     ];
     curl_capture("GET", &cfg.claude_models_url, &headers, b"", 30)
+}
+
+pub fn fetch_opencode_go_models(cfg: &Config) -> Result<CurlResponse, String> {
+    let auth = load_opencode_go_auth(cfg)?;
+    let headers = vec![
+        ("Accept", "application/json".to_string()),
+        ("Authorization", format!("Bearer {}", auth.api_key)),
+    ];
+    curl_capture("GET", &cfg.opencode_go_models_url, &headers, b"", 30)
 }
 
 pub fn curl_capture(
@@ -362,7 +497,13 @@ fn chat_to_responses(value: Json, cfg: &Config) -> Result<Json, String> {
     let model = value
         .get_str("model")
         .unwrap_or(&cfg.default_model)
-        .trim_start_matches("cx/")
+        .strip_prefix("cx/")
+        .or_else(|| {
+            value
+                .get_str("model")
+                .and_then(|m| m.strip_prefix("codex/"))
+        })
+        .unwrap_or_else(|| value.get_str("model").unwrap_or(&cfg.default_model))
         .to_string();
     out.set("model", Json::String(model));
     if let Some(stream) = value.get_bool("stream") {
@@ -471,8 +612,8 @@ fn normalize_codex_body(body: &mut Json, cfg: &Config) -> Result<(), String> {
     let model = body
         .get_str("model")
         .unwrap_or(&cfg.default_model)
-        .trim_start_matches("cx/")
         .to_string();
+    let model = model_id_for_provider(&model, PROVIDER_CODEX);
     body.set("model", Json::String(resolve_model_id(cfg, &model)));
     body.set("stream", Json::Bool(true));
     body.set("store", Json::Bool(false));
@@ -526,16 +667,24 @@ fn normalize_codex_body(body: &mut Json, cfg: &Config) -> Result<(), String> {
 }
 
 fn transform_claude_request(raw: &[u8], cfg: &Config) -> Result<String, String> {
+    transform_anthropic_messages_request(raw, cfg, PROVIDER_CLAUDE, DEFAULT_CLAUDE_SYSTEM_PROMPT)
+}
+
+fn transform_anthropic_messages_request(
+    raw: &[u8],
+    cfg: &Config,
+    provider_id: &str,
+    default_system_prompt: &str,
+) -> Result<String, String> {
     let input = json::parse(&String::from_utf8_lossy(raw))?;
     let mut body = Json::object();
     let model = input
         .get_str("model")
         .unwrap_or(&cfg.default_model)
-        .trim_start_matches("cc/")
         .to_string();
     body.set(
         "model",
-        Json::String(resolve_model_id_for_provider(cfg, &model, "claude")),
+        Json::String(resolve_model_id_for_provider(cfg, &model, provider_id)),
     );
     body.set(
         "max_tokens",
@@ -549,12 +698,12 @@ fn transform_claude_request(raw: &[u8], cfg: &Config) -> Result<String, String> 
     if let Some(v) = input.get("temperature") {
         body.set("temperature", v.clone());
     }
-    let (system_blocks, messages) = claude_messages_from_openai(&input);
+    let (system_blocks, messages) = claude_messages_from_openai(&input, default_system_prompt);
     body.set("messages", Json::Array(messages));
     if system_blocks.is_empty() {
         body.set(
             "system",
-            Json::Array(vec![claude_text_block(DEFAULT_CLAUDE_SYSTEM_PROMPT)]),
+            Json::Array(vec![claude_text_block(default_system_prompt)]),
         );
     } else {
         body.set("system", Json::Array(system_blocks));
@@ -565,8 +714,11 @@ fn transform_claude_request(raw: &[u8], cfg: &Config) -> Result<String, String> 
     Ok(body.stringify())
 }
 
-fn claude_messages_from_openai(input: &Json) -> (Vec<Json>, Vec<Json>) {
-    let mut system_blocks = vec![claude_text_block(DEFAULT_CLAUDE_SYSTEM_PROMPT)];
+fn claude_messages_from_openai(
+    input: &Json,
+    default_system_prompt: &str,
+) -> (Vec<Json>, Vec<Json>) {
+    let mut system_blocks = vec![claude_text_block(default_system_prompt)];
     let mut messages = Vec::new();
 
     if let Some(Json::Array(values)) = input.get("messages") {
@@ -748,12 +900,16 @@ fn number_from_json(value: Option<&Json>) -> Option<u64> {
 }
 
 fn resolve_model_id_for_provider(cfg: &Config, model: &str, provider_id: &str) -> String {
+    let provider_id = canonical_provider_id(provider_id);
+    let model = model_id_for_provider(model, &provider_id);
     for configured in load_models(cfg) {
-        if configured.id == model && configured.provider_id == provider_id {
+        if canonical_provider_id(&configured.provider_id) == provider_id
+            && (configured.id == model || configured.upstream_id == model)
+        {
             return configured.upstream_id;
         }
     }
-    model.to_string()
+    model
 }
 
 fn runtime_os() -> &'static str {
@@ -853,6 +1009,7 @@ fn infer_effort(model: &str) -> String {
 }
 
 fn resolve_model_id(cfg: &Config, model: &str) -> String {
+    let model = model_id_for_provider(model, PROVIDER_CODEX);
     let mut id = model.to_string();
     for effort in ["-none", "-low", "-medium", "-high", "-xhigh"] {
         if id.ends_with(effort) {
@@ -860,7 +1017,9 @@ fn resolve_model_id(cfg: &Config, model: &str) -> String {
         }
     }
     for configured in load_models(cfg) {
-        if configured.id == model {
+        if canonical_provider_id(&configured.provider_id) == PROVIDER_CODEX
+            && configured.id == model
+        {
             return configured.upstream_id;
         }
     }
@@ -878,22 +1037,28 @@ fn request_provider_id(req: &http::Request, cfg: &Config) -> String {
 }
 
 fn provider_for_model(cfg: &Config, model: &str) -> String {
+    if let Some((provider_id, _)) = split_model_provider_prefix(model) {
+        return provider_id;
+    }
     for configured in load_models(cfg) {
-        if configured.id == model {
-            return configured.provider_id;
+        if configured.id == model || configured.upstream_id == model {
+            return canonical_provider_id(&configured.provider_id);
         }
     }
-    if model.starts_with("claude-") || model.starts_with("cc/claude-") {
-        "claude".to_string()
+    if model.starts_with("claude-") {
+        PROVIDER_CLAUDE.to_string()
+    } else if crate::config::is_opencode_go_model(model) {
+        PROVIDER_OPENCODE_GO.to_string()
     } else {
-        "codex".to_string()
+        PROVIDER_CODEX.to_string()
     }
 }
 
 fn provider_enabled(cfg: &Config, provider_id: &str) -> bool {
+    let provider_id = canonical_provider_id(provider_id);
     load_providers(cfg)
         .into_iter()
-        .find(|p| p.id == provider_id)
+        .find(|p| canonical_provider_id(&p.id) == provider_id)
         .map(|p| p.enabled)
         .unwrap_or(true)
 }
@@ -911,12 +1076,9 @@ fn load_or_refresh_codex_auth(cfg: &Config) -> Result<CodexAuth, String> {
 }
 
 fn read_codex_auth(cfg: &Config) -> Result<Json, String> {
-    let text = fs::read_to_string(&cfg.codex_auth_path).map_err(|e| {
-        format!(
-            "failed to read Codex auth at {}: {e}",
-            cfg.codex_auth_path.display()
-        )
-    })?;
+    let path = provider_auth_path(cfg, PROVIDER_CODEX);
+    let text = fs::read_to_string(&path)
+        .map_err(|e| format!("failed to read Codex auth at {}: {e}", path.display()))?;
     json::parse(&text).map_err(|e| format!("failed to parse Codex auth JSON: {e}"))
 }
 
@@ -925,20 +1087,45 @@ fn load_or_refresh_claude_auth(cfg: &Config) -> Result<ClaudeAuth, String> {
     extract_claude_auth(&root)
 }
 
+fn load_opencode_go_auth(cfg: &Config) -> Result<OpenCodeGoAuth, String> {
+    let path = provider_auth_path(cfg, PROVIDER_OPENCODE_GO);
+    let text = fs::read_to_string(&path)
+        .map_err(|e| format!("failed to read OpenCode Go auth at {}: {e}", path.display()))?;
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Err("OpenCode Go auth file is empty".to_string());
+    }
+    if !trimmed.starts_with('{') {
+        return Ok(OpenCodeGoAuth {
+            api_key: trimmed.to_string(),
+        });
+    }
+    let root =
+        json::parse(trimmed).map_err(|e| format!("failed to parse OpenCode auth JSON: {e}"))?;
+    extract_opencode_go_auth(&root)
+}
+
 fn read_claude_auth(cfg: &Config) -> Result<Json, String> {
-    let text = fs::read_to_string(&cfg.claude_auth_path).map_err(|e| {
-        format!(
-            "failed to read Claude auth at {}: {e}",
-            cfg.claude_auth_path.display()
-        )
-    })?;
+    let path = provider_auth_path(cfg, PROVIDER_CLAUDE);
+    let text = fs::read_to_string(&path)
+        .map_err(|e| format!("failed to read Claude auth at {}: {e}", path.display()))?;
     json::parse(&text).map_err(|e| format!("failed to parse Claude auth JSON: {e}"))
 }
 
 fn write_codex_auth(cfg: &Config, root: &Json) -> Result<(), String> {
-    fs::write(&cfg.codex_auth_path, root.stringify()).map_err(|e| e.to_string())?;
-    let _ = fs::set_permissions(&cfg.codex_auth_path, fs::Permissions::from_mode(0o600));
+    let path = provider_auth_path(cfg, PROVIDER_CODEX);
+    fs::write(&path, root.stringify()).map_err(|e| e.to_string())?;
+    let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
     Ok(())
+}
+
+fn provider_auth_path(cfg: &Config, provider_id: &str) -> PathBuf {
+    let provider_id = canonical_provider_id(provider_id);
+    load_providers(cfg)
+        .into_iter()
+        .find(|p| canonical_provider_id(&p.id) == provider_id)
+        .map(|p| p.auth_path)
+        .unwrap_or_else(|| default_provider_auth_path(cfg, &provider_id))
 }
 
 fn extract_codex_auth(root: &Json) -> Result<CodexAuth, String> {
@@ -979,6 +1166,32 @@ fn extract_claude_auth(root: &Json) -> Result<ClaudeAuth, String> {
         );
     }
     Ok(ClaudeAuth { access_token })
+}
+
+fn extract_opencode_go_auth(root: &Json) -> Result<OpenCodeGoAuth, String> {
+    for provider_id in [PROVIDER_OPENCODE_GO, "opencode"] {
+        if let Some(provider) = root.get(provider_id) {
+            for key_name in ["key", "apiKey", "api_key", "accessToken", "access_token"] {
+                if let Some(key) = provider.get_str(key_name) {
+                    if !key.trim().is_empty() {
+                        return Ok(OpenCodeGoAuth {
+                            api_key: key.trim().to_string(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    for key_name in ["apiKey", "api_key", "key"] {
+        if let Some(key) = root.get_str(key_name) {
+            if !key.trim().is_empty() {
+                return Ok(OpenCodeGoAuth {
+                    api_key: key.trim().to_string(),
+                });
+            }
+        }
+    }
+    Err("OpenCode auth missing opencode-go.key; run `opencode auth login` or configure an API key file".to_string())
 }
 
 fn token_expiring_soon(access_token: &str) -> bool {
@@ -1095,6 +1308,40 @@ fn error_json(message: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ensure_default_files;
+    use std::path::PathBuf;
+
+    fn test_config(name: &str) -> Config {
+        let data_dir = std::env::temp_dir().join(format!(
+            "akurai-router-test-{}-{}",
+            name,
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&data_dir);
+        std::fs::create_dir_all(&data_dir).unwrap();
+        Config {
+            listen_addr: "127.0.0.1:0".to_string(),
+            public_base_url: "http://127.0.0.1:0".to_string(),
+            data_dir,
+            api_key: "akr_test".to_string(),
+            codex_auth_path: PathBuf::from("/tmp/codex-auth.json"),
+            codex_responses_url: "https://example.com/codex".to_string(),
+            codex_models_url: "https://example.com/codex-models".to_string(),
+            claude_auth_path: PathBuf::from("/tmp/claude-auth.json"),
+            claude_messages_url: "https://example.com/claude".to_string(),
+            claude_models_url: "https://example.com/claude-models".to_string(),
+            opencode_go_auth_path: PathBuf::from("/tmp/opencode-auth.json"),
+            opencode_go_chat_url: "https://example.com/opencode-chat".to_string(),
+            opencode_go_messages_url: "https://example.com/opencode-messages".to_string(),
+            opencode_go_models_url: "https://example.com/opencode-models".to_string(),
+            default_model: "gpt-5.4-mini".to_string(),
+            idp_issuer: "https://auth.example.com".to_string(),
+            idp_client_id: "client".to_string(),
+            idp_client_secret: "secret".to_string(),
+            admin_allowed_email: "user@example.com".to_string(),
+            cookie_secret: "012345678901234567890123456789".to_string(),
+        }
+    }
 
     #[test]
     fn forwards_image_url_as_input_image() {
@@ -1141,5 +1388,69 @@ mod tests {
         assert_eq!(parts.len(), 1);
         assert_eq!(parts[0].get_str("type"), Some("input_text"));
         assert_eq!(parts[0].get_str("text"), Some("..."));
+    }
+
+    #[test]
+    fn models_json_uses_provider_prefixed_ids() {
+        let cfg = test_config("prefixed-models");
+        ensure_default_files(&cfg).unwrap();
+        let parsed = json::parse(&models_json(&cfg)).unwrap();
+        let ids = match parsed.get("data").unwrap() {
+            Json::Array(items) => items
+                .iter()
+                .filter_map(|item| item.get_str("id"))
+                .collect::<Vec<_>>(),
+            _ => panic!("models data should be an array"),
+        };
+        assert!(ids.contains(&"codex/gpt-5.4-mini"));
+        assert!(ids.contains(&"claude/claude-opus-4-8"));
+        assert!(ids.contains(&"opencode-go/glm-5.2"));
+        assert!(ids.contains(&"opencode-go/qwen3.7-plus"));
+    }
+
+    #[test]
+    fn provider_prefixes_route_to_canonical_providers() {
+        let cfg = test_config("provider-prefixes");
+        ensure_default_files(&cfg).unwrap();
+        assert_eq!(
+            provider_for_model(&cfg, "codex/gpt-5.4-mini"),
+            PROVIDER_CODEX
+        );
+        assert_eq!(
+            provider_for_model(&cfg, "claude/claude-opus-4-8"),
+            PROVIDER_CLAUDE
+        );
+        assert_eq!(
+            provider_for_model(&cfg, "opencode-go/glm-5.2"),
+            PROVIDER_OPENCODE_GO
+        );
+        assert_eq!(
+            provider_for_model(&cfg, "ocg/qwen3.7-plus"),
+            PROVIDER_OPENCODE_GO
+        );
+    }
+
+    #[test]
+    fn prefixed_models_normalize_for_upstream_requests() {
+        let cfg = test_config("normalize-prefixes");
+        ensure_default_files(&cfg).unwrap();
+        let codex = transform_request(
+            "/v1/chat/completions",
+            br#"{"model":"codex/gpt-5.3-codex-high","messages":[{"role":"user","content":"hi"}]}"#,
+            &cfg,
+        )
+        .unwrap();
+        let parsed = json::parse(&codex).unwrap();
+        assert_eq!(parsed.get_str("model"), Some("gpt-5.3-codex"));
+
+        let opencode = transform_anthropic_messages_request(
+            br#"{"model":"opencode-go/qwen3.7-plus","messages":[{"role":"user","content":"hi"}]}"#,
+            &cfg,
+            PROVIDER_OPENCODE_GO,
+            DEFAULT_OPENCODE_SYSTEM_PROMPT,
+        )
+        .unwrap();
+        let parsed = json::parse(&opencode).unwrap();
+        assert_eq!(parsed.get_str("model"), Some("qwen3.7-plus"));
     }
 }

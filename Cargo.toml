@@ -2,7 +2,7 @@
 name = "akurai-router"
 version = "0.1.0"
 edition = "2024"
-description = "A std-only OpenAI-compatible router for Codex OAuth endpoints."
+description = "A std-only OpenAI-compatible router for Codex, Claude Code, and OpenCode Go."
 license = "MIT"
 repository = "https://github.com/olibuijr/AkurAI-Router"
 

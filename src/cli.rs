@@ -3,7 +3,9 @@ use std::path::PathBuf;
 
 use crate::auth;
 use crate::config::{
-    Config, Model, Provider, ensure_default_files, load_models, load_providers, save_models,
+    Config, Model, PROVIDER_CLAUDE, PROVIDER_CODEX, PROVIDER_OPENCODE_GO, Provider,
+    canonical_provider_id, default_provider_auth_path, ensure_default_files,
+    infer_model_provider_id, load_models, load_providers, provider_display_name, save_models,
     save_providers, write_local_env_template,
 };
 use crate::http::{self, Request};
@@ -120,28 +122,23 @@ fn providers(args: &[String]) -> Result<(), String> {
             Ok(())
         }
         Some("add") => {
-            let id = args.get(1).map(|s| s.as_str()).unwrap_or("codex");
-            if id != "codex" && id != "claude" {
-                return Err("provider id must be codex or claude".to_string());
+            let id = canonical_provider_id(args.get(1).map(|s| s.as_str()).unwrap_or("codex"));
+            if ![PROVIDER_CODEX, PROVIDER_CLAUDE, PROVIDER_OPENCODE_GO]
+                .contains(&id.as_str())
+            {
+                return Err("provider id must be codex, claude, or opencode-go".to_string());
             }
             let auth_path = args
                 .iter()
                 .position(|s| s == "--auth-path")
                 .and_then(|i| args.get(i + 1))
                 .map(PathBuf::from)
-                .unwrap_or_else(|| match id {
-                    "claude" => cfg.claude_auth_path.clone(),
-                    _ => cfg.codex_auth_path.clone(),
-                });
+                .unwrap_or_else(|| default_provider_auth_path(&cfg, &id));
             let mut providers = load_providers(&cfg);
-            providers.retain(|p| p.id != id);
+            providers.retain(|p| canonical_provider_id(&p.id) != id);
             providers.push(Provider {
-                id: id.to_string(),
-                name: if id == "claude" {
-                    "Claude Code".to_string()
-                } else {
-                    "OpenAI Codex".to_string()
-                },
+                id: id.clone(),
+                name: provider_display_name(&id).to_string(),
                 enabled: true,
                 auth_path,
             });
@@ -150,7 +147,7 @@ fn providers(args: &[String]) -> Result<(), String> {
         Some("disable") => set_provider_enabled(&cfg, false, args.get(1).map(|s| s.as_str())),
         Some("enable") => set_provider_enabled(&cfg, true, args.get(1).map(|s| s.as_str())),
         _ => Err(
-            "usage: akurai-router providers [list|add codex|claude --auth-path PATH|enable [ID]|disable [ID]]"
+            "usage: akurai-router providers [list|add codex|claude|opencode-go --auth-path PATH|enable [ID]|disable [ID]]"
                 .to_string(),
         ),
     }
@@ -162,9 +159,9 @@ fn set_provider_enabled(
     provider_id: Option<&str>,
 ) -> Result<(), String> {
     let mut providers = load_providers(cfg);
-    let target = provider_id.unwrap_or("codex");
+    let target = canonical_provider_id(provider_id.unwrap_or("codex"));
     for provider in &mut providers {
-        if provider.id == target {
+        if canonical_provider_id(&provider.id) == target {
             provider.enabled = enabled;
         }
     }
@@ -192,13 +189,10 @@ fn models(args: &[String]) -> Result<(), String> {
             let id = args.get(1).ok_or_else(|| "model id required".to_string())?.clone();
             let name = args.get(2).cloned().unwrap_or_else(|| id.clone());
             let upstream_id = args.get(3).cloned().unwrap_or_else(|| id.clone());
-            let provider_id = args.get(4).cloned().unwrap_or_else(|| {
-                if id.starts_with("claude-") || id.starts_with("cc/claude-") {
-                    "claude".to_string()
-                } else {
-                    "codex".to_string()
-                }
-            });
+            let provider_id = args
+                .get(4)
+                .map(|s| canonical_provider_id(s))
+                .unwrap_or_else(|| infer_model_provider_id(&id));
             let mut models = load_models(&cfg);
             models.retain(|m| m.id != id);
             models.push(Model {
@@ -272,6 +266,7 @@ Usage:
   akurai-router providers list
   akurai-router providers add codex --auth-path ~/.codex/auth.json
   akurai-router providers add claude --auth-path ~/.claude/.credentials.json
+  akurai-router providers add opencode-go --auth-path ~/.local/share/opencode/auth.json
   akurai-router providers enable [ID]
   akurai-router providers disable [ID]
   akurai-router models list
@@ -286,6 +281,7 @@ Environment:
   AKURAI_ROUTER_COOKIE_SECRET=...
   AKURAI_ROUTER_CODEX_AUTH_PATH=/home/ubuntu/.codex/auth.json
   AKURAI_ROUTER_CLAUDE_AUTH_PATH=/home/olafurbui/.claude/.credentials.json
+  AKURAI_ROUTER_OPENCODE_GO_AUTH_PATH=/home/olafurbui/.local/share/opencode/auth.json
   AKURAI_ROUTER_IDP_ISSUER=https://auth.olibuijr.com
   AKURAI_ROUTER_IDP_CLIENT_ID=...
   AKURAI_ROUTER_IDP_CLIENT_SECRET=...

@@ -4,6 +4,10 @@ use std::path::PathBuf;
 
 use crate::util::{env_quote, random_hex};
 
+pub const PROVIDER_CODEX: &str = "codex";
+pub const PROVIDER_CLAUDE: &str = "claude";
+pub const PROVIDER_OPENCODE_GO: &str = "opencode-go";
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub listen_addr: String,
@@ -16,6 +20,10 @@ pub struct Config {
     pub claude_auth_path: PathBuf,
     pub claude_messages_url: String,
     pub claude_models_url: String,
+    pub opencode_go_auth_path: PathBuf,
+    pub opencode_go_chat_url: String,
+    pub opencode_go_messages_url: String,
+    pub opencode_go_models_url: String,
     pub default_model: String,
     pub idp_issuer: String,
     pub idp_client_id: String,
@@ -93,6 +101,22 @@ impl Config {
                 "AKURAI_ROUTER_CLAUDE_MODELS_URL",
                 "https://api.anthropic.com/v1/models",
             ),
+            opencode_go_auth_path: PathBuf::from(get(
+                "AKURAI_ROUTER_OPENCODE_GO_AUTH_PATH",
+                &format!("{home}/.local/share/opencode/auth.json"),
+            )),
+            opencode_go_chat_url: get(
+                "AKURAI_ROUTER_OPENCODE_GO_CHAT_URL",
+                "https://opencode.ai/zen/go/v1/chat/completions",
+            ),
+            opencode_go_messages_url: get(
+                "AKURAI_ROUTER_OPENCODE_GO_MESSAGES_URL",
+                "https://opencode.ai/zen/go/v1/messages",
+            ),
+            opencode_go_models_url: get(
+                "AKURAI_ROUTER_OPENCODE_GO_MODELS_URL",
+                "https://opencode.ai/zen/go/v1/models",
+            ),
             default_model: get("AKURAI_ROUTER_DEFAULT_MODEL", "gpt-5.4-mini"),
             idp_issuer: get("AKURAI_ROUTER_IDP_ISSUER", "https://auth.olibuijr.com")
                 .trim_end_matches('/')
@@ -129,23 +153,16 @@ pub fn ensure_default_files(cfg: &Config) -> Result<(), String> {
     let providers_path = cfg.data_dir.join("providers.conf");
     let mut providers = load_providers(cfg);
     let mut providers_changed = false;
-    if !providers.iter().any(|p| p.id == "codex") {
-        providers.push(Provider {
-            id: "codex".to_string(),
-            name: "OpenAI Codex".to_string(),
-            enabled: true,
-            auth_path: cfg.codex_auth_path.clone(),
-        });
-        providers_changed = true;
-    }
-    if !providers.iter().any(|p| p.id == "claude") {
-        providers.push(Provider {
-            id: "claude".to_string(),
-            name: "Claude Code".to_string(),
-            enabled: true,
-            auth_path: cfg.claude_auth_path.clone(),
-        });
-        providers_changed = true;
+    for provider_id in [PROVIDER_CODEX, PROVIDER_CLAUDE, PROVIDER_OPENCODE_GO] {
+        if !providers.iter().any(|p| p.id == provider_id) {
+            providers.push(Provider {
+                id: provider_id.to_string(),
+                name: provider_display_name(provider_id).to_string(),
+                enabled: true,
+                auth_path: default_provider_auth_path(cfg, provider_id),
+            });
+            providers_changed = true;
+        }
     }
     if !providers_path.exists() || providers_changed {
         save_providers(cfg, &providers)?;
@@ -166,70 +183,80 @@ pub fn ensure_default_files(cfg: &Config) -> Result<(), String> {
 }
 
 pub fn default_models() -> Vec<Model> {
-    [
-        ("gpt-5.5", "GPT 5.5", "gpt-5.5", "codex"),
-        ("gpt-5.4", "GPT 5.4", "gpt-5.4", "codex"),
-        ("gpt-5.4-mini", "GPT 5.4 Mini", "gpt-5.4-mini", "codex"),
-        ("gpt-5.3-codex", "GPT 5.3 Codex", "gpt-5.3-codex", "codex"),
+    let mut models = [
+        ("gpt-5.5", "GPT 5.5", "gpt-5.5", PROVIDER_CODEX),
+        ("gpt-5.4", "GPT 5.4", "gpt-5.4", PROVIDER_CODEX),
+        (
+            "gpt-5.4-mini",
+            "GPT 5.4 Mini",
+            "gpt-5.4-mini",
+            PROVIDER_CODEX,
+        ),
+        (
+            "gpt-5.3-codex",
+            "GPT 5.3 Codex",
+            "gpt-5.3-codex",
+            PROVIDER_CODEX,
+        ),
         (
             "gpt-5.3-codex-high",
             "GPT 5.3 Codex High",
             "gpt-5.3-codex",
-            "codex",
+            PROVIDER_CODEX,
         ),
         (
             "gpt-5.3-codex-low",
             "GPT 5.3 Codex Low",
             "gpt-5.3-codex",
-            "codex",
+            PROVIDER_CODEX,
         ),
         (
             "claude-opus-4-8",
             "Claude Opus 4.8",
             "claude-opus-4-8",
-            "claude",
+            PROVIDER_CLAUDE,
         ),
         (
             "claude-opus-4-7",
             "Claude Opus 4.7",
             "claude-opus-4-7",
-            "claude",
+            PROVIDER_CLAUDE,
         ),
         (
             "claude-opus-4-6",
             "Claude Opus 4.6",
             "claude-opus-4-6",
-            "claude",
+            PROVIDER_CLAUDE,
         ),
         (
             "claude-sonnet-4-6",
             "Claude Sonnet 4.6",
             "claude-sonnet-4-6",
-            "claude",
+            PROVIDER_CLAUDE,
         ),
         (
             "claude-opus-4-5-20251101",
             "Claude Opus 4.5",
             "claude-opus-4-5-20251101",
-            "claude",
+            PROVIDER_CLAUDE,
         ),
         (
             "claude-haiku-4-5-20251001",
             "Claude Haiku 4.5",
             "claude-haiku-4-5-20251001",
-            "claude",
+            PROVIDER_CLAUDE,
         ),
         (
             "claude-sonnet-4-5-20250929",
             "Claude Sonnet 4.5",
             "claude-sonnet-4-5-20250929",
-            "claude",
+            PROVIDER_CLAUDE,
         ),
         (
             "claude-opus-4-1-20250805",
             "Claude Opus 4.1",
             "claude-opus-4-1-20250805",
-            "claude",
+            PROVIDER_CLAUDE,
         ),
     ]
     .into_iter()
@@ -238,6 +265,40 @@ pub fn default_models() -> Vec<Model> {
         name: name.to_string(),
         upstream_id: upstream_id.to_string(),
         provider_id: provider_id.to_string(),
+        enabled: true,
+    })
+    .collect::<Vec<_>>();
+    models.extend(opencode_go_default_models());
+    models
+}
+
+pub fn opencode_go_default_models() -> Vec<Model> {
+    [
+        ("glm-5.2", "GLM 5.2", "glm-5.2"),
+        ("glm-5.1", "GLM 5.1", "glm-5.1"),
+        ("kimi-k2.7-code", "Kimi K2.7 Code", "kimi-k2.7-code"),
+        ("kimi-k2.6", "Kimi K2.6", "kimi-k2.6"),
+        ("deepseek-v4-pro", "DeepSeek V4 Pro", "deepseek-v4-pro"),
+        (
+            "deepseek-v4-flash",
+            "DeepSeek V4 Flash",
+            "deepseek-v4-flash",
+        ),
+        ("mimo-v2.5", "MiMo V2.5", "mimo-v2.5"),
+        ("mimo-v2.5-pro", "MiMo V2.5 Pro", "mimo-v2.5-pro"),
+        ("minimax-m3", "MiniMax M3", "minimax-m3"),
+        ("minimax-m2.7", "MiniMax M2.7", "minimax-m2.7"),
+        ("minimax-m2.5", "MiniMax M2.5", "minimax-m2.5"),
+        ("qwen3.7-max", "Qwen 3.7 Max", "qwen3.7-max"),
+        ("qwen3.7-plus", "Qwen 3.7 Plus", "qwen3.7-plus"),
+        ("qwen3.6-plus", "Qwen 3.6 Plus", "qwen3.6-plus"),
+    ]
+    .into_iter()
+    .map(|(id, name, upstream_id)| Model {
+        id: id.to_string(),
+        name: name.to_string(),
+        upstream_id: upstream_id.to_string(),
+        provider_id: PROVIDER_OPENCODE_GO.to_string(),
         enabled: true,
     })
     .collect()
@@ -312,20 +373,15 @@ pub fn load_providers(cfg: &Config) -> Vec<Provider> {
         });
     }
     if providers.is_empty() {
-        vec![
-            Provider {
-                id: "codex".to_string(),
-                name: "OpenAI Codex".to_string(),
+        [PROVIDER_CODEX, PROVIDER_CLAUDE, PROVIDER_OPENCODE_GO]
+            .into_iter()
+            .map(|provider_id| Provider {
+                id: provider_id.to_string(),
+                name: provider_display_name(provider_id).to_string(),
                 enabled: true,
-                auth_path: cfg.codex_auth_path.clone(),
-            },
-            Provider {
-                id: "claude".to_string(),
-                name: "Claude Code".to_string(),
-                enabled: true,
-                auth_path: cfg.claude_auth_path.clone(),
-            },
-        ]
+                auth_path: default_provider_auth_path(cfg, provider_id),
+            })
+            .collect()
     } else {
         providers
     }
@@ -359,13 +415,14 @@ pub fn write_local_env_template(cfg: &Config) -> Result<PathBuf, String> {
         cfg.cookie_secret.clone()
     };
     let content = format!(
-        "AKURAI_ROUTER_LISTEN={}\nAKURAI_ROUTER_PUBLIC_URL={}\nAKURAI_ROUTER_API_KEY={}\nAKURAI_ROUTER_COOKIE_SECRET={}\nAKURAI_ROUTER_CODEX_AUTH_PATH={}\nAKURAI_ROUTER_CLAUDE_AUTH_PATH={}\nAKURAI_ROUTER_DEFAULT_MODEL={}\nAKURAI_ROUTER_IDP_ISSUER={}\nAKURAI_ROUTER_IDP_CLIENT_ID={}\nAKURAI_ROUTER_IDP_CLIENT_SECRET={}\nAKURAI_ROUTER_ADMIN_EMAIL={}\n",
+        "AKURAI_ROUTER_LISTEN={}\nAKURAI_ROUTER_PUBLIC_URL={}\nAKURAI_ROUTER_API_KEY={}\nAKURAI_ROUTER_COOKIE_SECRET={}\nAKURAI_ROUTER_CODEX_AUTH_PATH={}\nAKURAI_ROUTER_CLAUDE_AUTH_PATH={}\nAKURAI_ROUTER_OPENCODE_GO_AUTH_PATH={}\nAKURAI_ROUTER_DEFAULT_MODEL={}\nAKURAI_ROUTER_IDP_ISSUER={}\nAKURAI_ROUTER_IDP_CLIENT_ID={}\nAKURAI_ROUTER_IDP_CLIENT_SECRET={}\nAKURAI_ROUTER_ADMIN_EMAIL={}\n",
         env_quote(&cfg.listen_addr),
         env_quote(&cfg.public_base_url),
         env_quote(&api_key),
         env_quote(&cookie_secret),
         env_quote(&cfg.codex_auth_path.display().to_string()),
         env_quote(&cfg.claude_auth_path.display().to_string()),
+        env_quote(&cfg.opencode_go_auth_path.display().to_string()),
         env_quote(&cfg.default_model),
         env_quote(&cfg.idp_issuer),
         env_quote(&cfg.idp_client_id),
@@ -376,12 +433,87 @@ pub fn write_local_env_template(cfg: &Config) -> Result<PathBuf, String> {
     Ok(path)
 }
 
-fn infer_model_provider_id(model_id: &str) -> String {
-    if model_id.starts_with("claude-") || model_id.starts_with("cc/claude-") {
-        "claude".to_string()
-    } else {
-        "codex".to_string()
+pub fn infer_model_provider_id(model_id: &str) -> String {
+    if let Some((provider_id, _)) = split_model_provider_prefix(model_id) {
+        return provider_id;
     }
+    if model_id.starts_with("claude-") {
+        PROVIDER_CLAUDE.to_string()
+    } else if is_opencode_go_model(model_id) {
+        PROVIDER_OPENCODE_GO.to_string()
+    } else {
+        PROVIDER_CODEX.to_string()
+    }
+}
+
+pub fn default_provider_auth_path(cfg: &Config, provider_id: &str) -> PathBuf {
+    match canonical_provider_id(provider_id).as_str() {
+        PROVIDER_CLAUDE => cfg.claude_auth_path.clone(),
+        PROVIDER_OPENCODE_GO => cfg.opencode_go_auth_path.clone(),
+        _ => cfg.codex_auth_path.clone(),
+    }
+}
+
+pub fn provider_display_name(provider_id: &str) -> &'static str {
+    match canonical_provider_id(provider_id).as_str() {
+        PROVIDER_CLAUDE => "Claude Code",
+        PROVIDER_OPENCODE_GO => "OpenCode Go",
+        _ => "OpenAI Codex",
+    }
+}
+
+pub fn canonical_provider_id(provider_id: &str) -> String {
+    match provider_id {
+        "cx" => PROVIDER_CODEX.to_string(),
+        "cc" => PROVIDER_CLAUDE.to_string(),
+        "opencode" | "ocg" => PROVIDER_OPENCODE_GO.to_string(),
+        other => other.to_string(),
+    }
+}
+
+pub fn split_model_provider_prefix(model_id: &str) -> Option<(String, String)> {
+    let (provider, model) = model_id.split_once('/')?;
+    if provider.is_empty() || model.is_empty() {
+        return None;
+    }
+    Some((canonical_provider_id(provider), model.to_string()))
+}
+
+pub fn model_id_for_provider(model_id: &str, provider_id: &str) -> String {
+    if let Some((prefix_provider, bare_model)) = split_model_provider_prefix(model_id) {
+        if prefix_provider == canonical_provider_id(provider_id) {
+            return bare_model;
+        }
+    }
+    model_id.to_string()
+}
+
+pub fn public_model_id(model: &Model) -> String {
+    if split_model_provider_prefix(&model.id).is_some() {
+        model.id.clone()
+    } else {
+        format!("{}/{}", canonical_provider_id(&model.provider_id), model.id)
+    }
+}
+
+pub fn is_opencode_go_messages_model(model_id: &str) -> bool {
+    let bare = model_id_for_provider(model_id, PROVIDER_OPENCODE_GO);
+    matches!(
+        bare.as_str(),
+        "minimax-m3"
+            | "minimax-m2.7"
+            | "minimax-m2.5"
+            | "qwen3.7-max"
+            | "qwen3.7-plus"
+            | "qwen3.6-plus"
+    )
+}
+
+pub fn is_opencode_go_model(model_id: &str) -> bool {
+    let bare = model_id_for_provider(model_id, PROVIDER_OPENCODE_GO);
+    opencode_go_default_models()
+        .into_iter()
+        .any(|model| model.id == bare)
 }
 
 fn read_kv(path: &PathBuf) -> Vec<(String, String)> {

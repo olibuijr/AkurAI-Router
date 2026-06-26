@@ -3,7 +3,9 @@ use std::path::PathBuf;
 
 use crate::auth;
 use crate::config::{
-    Config, Model, Provider, load_models, load_providers, save_models, save_providers,
+    Config, Model, Provider, canonical_provider_id, default_provider_auth_path,
+    infer_model_provider_id, load_models, load_providers, model_id_for_provider,
+    provider_display_name, public_model_id, save_models, save_providers,
 };
 use crate::http::{self, Request};
 use crate::upstream;
@@ -40,9 +42,9 @@ pub fn landing(req: &Request, stream: &mut TcpStream, cfg: &Config) {
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="AkurAI Router is a std-only Rust OpenAI-compatible endpoint for routing requests to Codex OAuth.">
+  <meta name="description" content="AkurAI Router is a std-only Rust OpenAI-compatible endpoint for Codex, Claude Code, and OpenCode Go routing.">
   <meta property="og:title" content="AkurAI Router">
-  <meta property="og:description" content="A minimal Rust OpenAI-compatible router for Codex OAuth.">
+  <meta property="og:description" content="A minimal Rust OpenAI-compatible router with provider-prefixed model routing.">
   <meta property="og:image" content="{base}/assets/hero.png">
   <title>AkurAI Router</title>
   <style>{css}</style>
@@ -60,9 +62,9 @@ pub fn landing(req: &Request, stream: &mut TcpStream, cfg: &Config) {
       </div>
     </nav>
     <section class="copy">
-      <p class="eyebrow">OpenAI endpoint. Codex OAuth upstream.</p>
+      <p class="eyebrow">OpenAI endpoint. Provider-prefixed routing.</p>
       <h1>AkurAI Router</h1>
-      <p class="lead">A small Rust service that exposes `/v1/responses` and `/v1/models`, authenticates tools with a private API key, and routes requests through a secure server-side Codex CLI OAuth identity.</p>
+      <p class="lead">A small Rust service that exposes `/v1/responses`, `/v1/chat/completions`, and `/v1/models`, authenticates tools with a private API key, and routes requests to Codex, Claude Code, or OpenCode Go.</p>
       <div class="actions">
         <a class="button" href="/login">Log in with AkurAI IDP</a>
         <a class="button ghost" href="https://github.com/olibuijr/AkurAI-Router">Source</a>
@@ -73,7 +75,7 @@ pub fn landing(req: &Request, stream: &mut TcpStream, cfg: &Config) {
     <div class="grid">
       <div><h2>One binary</h2><p>Rust standard library server, embedded landing asset, local config files, and no Rust crate dependencies.</p></div>
       <div><h2>Protected API</h2><p>Tooling calls use `Authorization: Bearer ...`; the admin UI uses AkurAI IDP SSO and an email allowlist.</p></div>
-      <div><h2>Codex native</h2><p>Requests are normalized for the Codex Responses endpoint with Codex CLI identity headers and OAuth token refresh.</p></div>
+      <div><h2>Provider native</h2><p>Model IDs use `codex/`, `claude/`, and `opencode-go/` prefixes while upstream auth stays server-side.</p></div>
     </div>
   </section>
 </body>
@@ -134,7 +136,7 @@ pub fn admin(req: &Request, stream: &mut TcpStream, cfg: &Config) {
         .map(|m| {
             format!(
                 r#"<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td><form method="post" action="/admin/models/remove"><input type="hidden" name="id" value="{}"><button class="icon" title="Remove">×</button></form></td></tr>"#,
-                html_escape(&m.id),
+                html_escape(&public_model_id(m)),
                 html_escape(&m.name),
                 html_escape(&m.upstream_id),
                 html_escape(&m.provider_id),
@@ -166,7 +168,7 @@ pub fn admin(req: &Request, stream: &mut TcpStream, cfg: &Config) {
     <h2>Login Setup</h2>
     <ol class="steps">
       <li>Refresh Codex OAuth with `codex login` for the configured service account when renewal is required.</li>
-      <li>Keep the configured Codex auth file readable only by the service account.</li>
+      <li>Keep configured Codex, Claude Code, and OpenCode Go auth files readable only by the service account.</li>
       <li>Configure clients with base URL `{base}/v1`, wire API `responses`, and the router API key from `/etc/akurai-router/router.env`.</li>
     </ol>
   </section>
@@ -196,9 +198,9 @@ pub fn admin(req: &Request, stream: &mut TcpStream, cfg: &Config) {
             "Provider auth missing"
         },
         provider_hint = if auth_ok {
-            "Keep each provider auth file readable only by the service account. Claude Code uses ~/.claude/.credentials.json; Codex uses ~/.codex/auth.json."
+            "Keep each provider auth file readable only by the service account. Codex uses ~/.codex/auth.json; Claude Code uses ~/.claude/.credentials.json; OpenCode Go uses ~/.local/share/opencode/auth.json."
         } else {
-            "Point each provider at the correct local OAuth file on the VM. Claude Code uses ~/.claude/.credentials.json; Codex uses ~/.codex/auth.json."
+            "Point each provider at the correct local auth file. Codex uses ~/.codex/auth.json; Claude Code uses ~/.claude/.credentials.json; OpenCode Go uses ~/.local/share/opencode/auth.json."
         },
         provider_rows = provider_rows,
         model_rows = model_rows,
@@ -219,23 +221,24 @@ pub fn admin_post(req: &Request, stream: &mut TcpStream, cfg: &Config) {
     match req.path.as_str() {
         "/admin/provider/save" => {
             let mut providers = load_providers(cfg);
-            let id = query_get(&form, "id").unwrap_or_else(|| "codex".to_string());
-            let auth_path = query_get(&form, "auth_path").unwrap_or_else(|| match id.as_str() {
-                "claude" => cfg.claude_auth_path.display().to_string(),
-                _ => cfg.codex_auth_path.display().to_string(),
-            });
+            let id = canonical_provider_id(
+                &query_get(&form, "id").unwrap_or_else(|| "codex".to_string()),
+            );
+            let auth_path = query_get(&form, "auth_path")
+                .unwrap_or_else(|| default_provider_auth_path(cfg, &id).display().to_string());
             let enabled = query_get(&form, "enabled").is_some();
-            if let Some(provider) = providers.iter_mut().find(|p| p.id == id) {
+            if let Some(provider) = providers
+                .iter_mut()
+                .find(|p| canonical_provider_id(&p.id) == id)
+            {
                 provider.enabled = enabled;
                 provider.auth_path = PathBuf::from(auth_path);
+                provider.id = id.clone();
+                provider.name = provider_display_name(&id).to_string();
             } else {
                 providers.push(Provider {
                     id: id.clone(),
-                    name: if id == "claude" {
-                        "Claude Code".to_string()
-                    } else {
-                        "OpenAI Codex".to_string()
-                    },
+                    name: provider_display_name(&id).to_string(),
                     enabled,
                     auth_path: PathBuf::from(auth_path),
                 });
@@ -253,13 +256,8 @@ pub fn admin_post(req: &Request, stream: &mut TcpStream, cfg: &Config) {
                     .unwrap_or_else(|| id.clone());
                 let provider_id = query_get(&form, "provider_id")
                     .filter(|s| !s.is_empty())
-                    .unwrap_or_else(|| {
-                        if id.starts_with("claude-") || id.starts_with("cc/claude-") {
-                            "claude".to_string()
-                        } else {
-                            "codex".to_string()
-                        }
-                    });
+                    .map(|s| canonical_provider_id(&s))
+                    .unwrap_or_else(|| infer_model_provider_id(&id));
                 let mut models = load_models(cfg);
                 models.retain(|m| m.id != id);
                 models.push(Model {
@@ -282,12 +280,17 @@ pub fn admin_post(req: &Request, stream: &mut TcpStream, cfg: &Config) {
         "/admin/models/sync" => {
             if let Ok(resp) = upstream::fetch_codex_models(cfg) {
                 if resp.status == 200 {
-                    merge_remote_models(cfg, &String::from_utf8_lossy(&resp.body));
+                    merge_remote_models(cfg, &String::from_utf8_lossy(&resp.body), "codex");
                 }
             }
             if let Ok(resp) = upstream::fetch_claude_models(cfg) {
                 if resp.status == 200 {
-                    merge_remote_models(cfg, &String::from_utf8_lossy(&resp.body));
+                    merge_remote_models(cfg, &String::from_utf8_lossy(&resp.body), "claude");
+                }
+            }
+            if let Ok(resp) = upstream::fetch_opencode_go_models(cfg) {
+                if resp.status == 200 {
+                    merge_remote_models(cfg, &String::from_utf8_lossy(&resp.body), "opencode-go");
                 }
             }
         }
@@ -296,7 +299,7 @@ pub fn admin_post(req: &Request, stream: &mut TcpStream, cfg: &Config) {
     let _ = http::redirect(stream, "/admin", &[]);
 }
 
-fn merge_remote_models(cfg: &Config, text: &str) {
+fn merge_remote_models(cfg: &Config, text: &str, provider_id: &str) {
     let Ok(json) = crate::json::parse(text) else {
         return;
     };
@@ -304,26 +307,27 @@ fn merge_remote_models(cfg: &Config, text: &str) {
     else {
         return;
     };
+    let provider_id = canonical_provider_id(provider_id);
     let mut models = load_models(cfg);
     for item in remote {
         let Some(id) = item.get_str("id").or_else(|| item.get_str("name")) else {
             continue;
         };
+        let model_id = model_id_for_provider(id, &provider_id);
         if skip_remote_model(id) {
             continue;
         }
-        if models.iter().any(|m| m.id == id) {
+        if models
+            .iter()
+            .any(|m| canonical_provider_id(&m.provider_id) == provider_id && m.id == model_id)
+        {
             continue;
         }
         models.push(Model {
-            id: id.to_string(),
+            id: model_id.clone(),
             name: id.to_string(),
-            upstream_id: id.to_string(),
-            provider_id: if id.starts_with("claude-") || id.starts_with("cc/claude-") {
-                "claude".to_string()
-            } else {
-                "codex".to_string()
-            },
+            upstream_id: model_id,
+            provider_id: provider_id.clone(),
             enabled: true,
         });
     }
