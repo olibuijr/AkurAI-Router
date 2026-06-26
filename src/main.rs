@@ -1,3 +1,4 @@
+mod accounts;
 mod auth;
 mod cli;
 mod config;

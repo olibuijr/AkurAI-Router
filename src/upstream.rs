@@ -5,6 +5,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
+use crate::accounts::{self, UsageRecord};
+use crate::auth::ApiActor;
 use crate::config::{
     Config, PROVIDER_CLAUDE, PROVIDER_CODEX, PROVIDER_OPENCODE_GO, canonical_provider_id,
     default_provider_auth_path, is_opencode_go_messages_model, load_models, load_providers,
@@ -59,7 +61,7 @@ pub fn models_json(cfg: &Config) -> String {
     root.stringify()
 }
 
-pub fn forward_model(req: &http::Request, stream: &mut TcpStream, cfg: &Config) {
+pub fn forward_model(req: &http::Request, stream: &mut TcpStream, cfg: &Config, actor: &ApiActor) {
     let provider_id = request_provider_id(req, cfg);
     if !provider_enabled(cfg, &provider_id) {
         let _ = http::send_json(
@@ -70,13 +72,14 @@ pub fn forward_model(req: &http::Request, stream: &mut TcpStream, cfg: &Config) 
         return;
     }
     match provider_id.as_str() {
-        PROVIDER_CLAUDE => forward_claude(req, stream, cfg),
-        PROVIDER_OPENCODE_GO => forward_opencode_go(req, stream, cfg),
-        _ => forward_codex(req, stream, cfg),
+        PROVIDER_CLAUDE => forward_claude(req, stream, cfg, actor),
+        PROVIDER_OPENCODE_GO => forward_opencode_go(req, stream, cfg, actor),
+        _ => forward_codex(req, stream, cfg, actor),
     }
 }
 
-pub fn forward_codex(req: &http::Request, stream: &mut TcpStream, cfg: &Config) {
+pub fn forward_codex(req: &http::Request, stream: &mut TcpStream, cfg: &Config, actor: &ApiActor) {
+    let requested_model = request_model(req, cfg);
     let body = match transform_request(&req.path, &req.body, cfg) {
         Ok(body) => body,
         Err(e) => {
@@ -113,12 +116,33 @@ pub fn forward_codex(req: &http::Request, stream: &mut TcpStream, cfg: &Config) 
         headers.push(("chatgpt-account-id".to_string(), auth.account_id));
     }
 
-    if let Err(e) = curl_stream_post(&cfg.codex_responses_url, &headers, body.as_bytes(), stream) {
-        let _ = http::send_json(stream, 502, &error_json(&e));
+    match curl_stream_post(&cfg.codex_responses_url, &headers, body.as_bytes(), stream) {
+        Ok(status) => record_usage(
+            cfg,
+            actor,
+            PROVIDER_CODEX,
+            &requested_model,
+            &req.path,
+            status,
+            None,
+        ),
+        Err(e) => {
+            record_usage(
+                cfg,
+                actor,
+                PROVIDER_CODEX,
+                &requested_model,
+                &req.path,
+                502,
+                None,
+            );
+            let _ = http::send_json(stream, 502, &error_json(&e));
+        }
     }
 }
 
-fn forward_claude(req: &http::Request, stream: &mut TcpStream, cfg: &Config) {
+fn forward_claude(req: &http::Request, stream: &mut TcpStream, cfg: &Config, actor: &ApiActor) {
+    let requested_model = request_model(req, cfg);
     let body = match transform_claude_request(&req.body, cfg) {
         Ok(body) => body,
         Err(e) => {
@@ -184,6 +208,16 @@ fn forward_claude(req: &http::Request, stream: &mut TcpStream, cfg: &Config) {
         900,
     ) {
         Ok(resp) => {
+            let text = String::from_utf8_lossy(&resp.body);
+            record_usage(
+                cfg,
+                actor,
+                PROVIDER_CLAUDE,
+                &requested_model,
+                &req.path,
+                resp.status,
+                Some(&text),
+            );
             if resp.status != 200 {
                 let _ = http::send_json(
                     stream,
@@ -203,12 +237,26 @@ fn forward_claude(req: &http::Request, stream: &mut TcpStream, cfg: &Config) {
             }
         }
         Err(e) => {
+            record_usage(
+                cfg,
+                actor,
+                PROVIDER_CLAUDE,
+                &requested_model,
+                &req.path,
+                502,
+                None,
+            );
             let _ = http::send_json(stream, 502, &error_json(&e));
         }
     }
 }
 
-fn forward_opencode_go(req: &http::Request, stream: &mut TcpStream, cfg: &Config) {
+fn forward_opencode_go(
+    req: &http::Request,
+    stream: &mut TcpStream,
+    cfg: &Config,
+    actor: &ApiActor,
+) {
     if !req.path.ends_with("/chat/completions") {
         let _ = http::send_json(
             stream,
@@ -224,10 +272,10 @@ fn forward_opencode_go(req: &http::Request, stream: &mut TcpStream, cfg: &Config
             return;
         }
     };
-    let requested_model = input.get_str("model").unwrap_or("glm-5.2");
-    let upstream_model = resolve_model_id_for_provider(cfg, requested_model, PROVIDER_OPENCODE_GO);
+    let requested_model = input.get_str("model").unwrap_or("glm-5.2").to_string();
+    let upstream_model = resolve_model_id_for_provider(cfg, &requested_model, PROVIDER_OPENCODE_GO);
     if is_opencode_go_messages_model(&upstream_model) {
-        forward_opencode_go_messages(req, stream, cfg);
+        forward_opencode_go_messages(req, stream, cfg, actor);
         return;
     }
 
@@ -253,17 +301,84 @@ fn forward_opencode_go(req: &http::Request, stream: &mut TcpStream, cfg: &Config
             format!("Bearer {}", auth.api_key),
         ),
     ];
-    if let Err(e) = curl_stream_post(
-        &cfg.opencode_go_chat_url,
-        &headers,
-        body.stringify().as_bytes(),
-        stream,
-    ) {
-        let _ = http::send_json(stream, 502, &error_json(&e));
+    let body_text = body.stringify();
+    if body.get_bool("stream").unwrap_or(false) {
+        match curl_stream_post(
+            &cfg.opencode_go_chat_url,
+            &headers,
+            body_text.as_bytes(),
+            stream,
+        ) {
+            Ok(status) => record_usage(
+                cfg,
+                actor,
+                PROVIDER_OPENCODE_GO,
+                &requested_model,
+                &req.path,
+                status,
+                None,
+            ),
+            Err(e) => {
+                record_usage(
+                    cfg,
+                    actor,
+                    PROVIDER_OPENCODE_GO,
+                    &requested_model,
+                    &req.path,
+                    502,
+                    None,
+                );
+                let _ = http::send_json(stream, 502, &error_json(&e));
+            }
+        }
+    } else {
+        let headers_ref: Vec<(&str, String)> = headers
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.clone()))
+            .collect();
+        match curl_capture(
+            "POST",
+            &cfg.opencode_go_chat_url,
+            &headers_ref,
+            body_text.as_bytes(),
+            900,
+        ) {
+            Ok(resp) => {
+                let text = String::from_utf8_lossy(&resp.body);
+                record_usage(
+                    cfg,
+                    actor,
+                    PROVIDER_OPENCODE_GO,
+                    &requested_model,
+                    &req.path,
+                    resp.status,
+                    Some(&text),
+                );
+                let _ = http::send_json(stream, resp.status, &text);
+            }
+            Err(e) => {
+                record_usage(
+                    cfg,
+                    actor,
+                    PROVIDER_OPENCODE_GO,
+                    &requested_model,
+                    &req.path,
+                    502,
+                    None,
+                );
+                let _ = http::send_json(stream, 502, &error_json(&e));
+            }
+        }
     }
 }
 
-fn forward_opencode_go_messages(req: &http::Request, stream: &mut TcpStream, cfg: &Config) {
+fn forward_opencode_go_messages(
+    req: &http::Request,
+    stream: &mut TcpStream,
+    cfg: &Config,
+    actor: &ApiActor,
+) {
+    let requested_model = request_model(req, cfg);
     let body = match transform_anthropic_messages_request(
         &req.body,
         cfg,
@@ -298,6 +413,16 @@ fn forward_opencode_go_messages(req: &http::Request, stream: &mut TcpStream, cfg
         900,
     ) {
         Ok(resp) => {
+            let text = String::from_utf8_lossy(&resp.body);
+            record_usage(
+                cfg,
+                actor,
+                PROVIDER_OPENCODE_GO,
+                &requested_model,
+                &req.path,
+                resp.status,
+                Some(&text),
+            );
             if resp.status != 200 {
                 let _ = http::send_json(
                     stream,
@@ -306,7 +431,6 @@ fn forward_opencode_go_messages(req: &http::Request, stream: &mut TcpStream, cfg
                 );
                 return;
             }
-            let text = String::from_utf8_lossy(&resp.body);
             match claude_to_openai_response(&text, cfg) {
                 Ok(json) => {
                     let _ = http::send_json(stream, 200, &json);
@@ -317,6 +441,15 @@ fn forward_opencode_go_messages(req: &http::Request, stream: &mut TcpStream, cfg
             }
         }
         Err(e) => {
+            record_usage(
+                cfg,
+                actor,
+                PROVIDER_OPENCODE_GO,
+                &requested_model,
+                &req.path,
+                502,
+                None,
+            );
             let _ = http::send_json(stream, 502, &error_json(&e));
         }
     }
@@ -354,6 +487,70 @@ pub fn fetch_opencode_go_models(cfg: &Config) -> Result<CurlResponse, String> {
         ("Authorization", format!("Bearer {}", auth.api_key)),
     ];
     curl_capture("GET", &cfg.opencode_go_models_url, &headers, b"", 30)
+}
+
+fn record_usage(
+    cfg: &Config,
+    actor: &ApiActor,
+    provider_id: &str,
+    model: &str,
+    endpoint: &str,
+    status: u16,
+    response_body: Option<&str>,
+) {
+    let (prompt_tokens, completion_tokens, total_tokens, cost_usd) =
+        usage_metrics(response_body.unwrap_or(""));
+    let _ = accounts::record_usage(
+        cfg,
+        &UsageRecord {
+            ts: now_secs(),
+            email: actor.email.clone(),
+            key_id: actor.key_id.clone(),
+            provider_id: provider_id.to_string(),
+            model: model.to_string(),
+            endpoint: endpoint.to_string(),
+            status,
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+            cost_usd,
+        },
+    );
+}
+
+fn usage_metrics(text: &str) -> (u64, u64, u64, f64) {
+    let Ok(root) = json::parse(text) else {
+        return (0, 0, 0, 0.0);
+    };
+    let cost = json_f64(root.get("cost")).unwrap_or(0.0);
+    let Some(usage) = root.get("usage") else {
+        return (0, 0, 0, cost);
+    };
+    let prompt = json_u64(usage.get("prompt_tokens"))
+        .or_else(|| json_u64(usage.get("input_tokens")))
+        .unwrap_or(0);
+    let completion = json_u64(usage.get("completion_tokens"))
+        .or_else(|| json_u64(usage.get("output_tokens")))
+        .unwrap_or(0);
+    let total = json_u64(usage.get("total_tokens")).unwrap_or(prompt + completion);
+    (prompt, completion, total, cost)
+}
+
+fn json_u64(value: Option<&Json>) -> Option<u64> {
+    match value? {
+        Json::Number(n) => n.parse().ok(),
+        Json::String(s) => s.parse().ok(),
+        _ => None,
+    }
+}
+
+fn json_f64(value: Option<&Json>) -> Option<f64> {
+    match value? {
+        Json::Number(n) => n.parse::<f64>().ok(),
+        Json::String(s) => s.parse::<f64>().ok(),
+        _ => None,
+    }
+    .filter(|v| v.is_finite())
 }
 
 pub fn curl_capture(
@@ -407,7 +604,7 @@ fn curl_stream_post(
     headers: &[(String, String)],
     body: &[u8],
     stream: &mut TcpStream,
-) -> Result<(), String> {
+) -> Result<u16, String> {
     let mut cmd = Command::new("curl");
     cmd.arg("--silent")
         .arg("--show-error")
@@ -477,7 +674,7 @@ fn curl_stream_post(
         stream.flush().map_err(|e| e.to_string())?;
     }
     let _ = child.wait();
-    Ok(())
+    Ok(status)
 }
 
 fn transform_request(path: &str, raw: &[u8], cfg: &Config) -> Result<String, String> {
@@ -1027,13 +1224,17 @@ fn resolve_model_id(cfg: &Config, model: &str) -> String {
 }
 
 fn request_provider_id(req: &http::Request, cfg: &Config) -> String {
+    provider_for_model(cfg, &request_model(req, cfg))
+}
+
+fn request_model(req: &http::Request, cfg: &Config) -> String {
     let raw = String::from_utf8_lossy(&req.body);
     if let Ok(root) = json::parse(&raw) {
         if let Some(model) = root.get_str("model") {
-            return provider_for_model(cfg, model);
+            return model.to_string();
         }
     }
-    provider_for_model(cfg, &cfg.default_model)
+    cfg.default_model.clone()
 }
 
 fn provider_for_model(cfg: &Config, model: &str) -> String {

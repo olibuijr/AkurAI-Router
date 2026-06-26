@@ -25,6 +25,8 @@ standard library does not ship a TLS client.
 - Basic multimodal forwarding for OpenAI `image_url` content on Codex models
 - API-key protection for every `/v1/*` route
 - Browser admin panel protected by AkurAI IDP SSO
+- Admin-managed router keys assigned to IDP user emails
+- Usage ledger and cost allocation by user, provider, and model
 - CLI for provider and model management
 - Embedded landing page and static hero asset
 - Single std-only Rust binary
@@ -59,7 +61,7 @@ uses provider prefixes: `codex/gpt-5.4-mini`, `claude/claude-opus-4-8`, and
 | `/` | `GET` | public | Landing page |
 | `/health` | `GET` | public | Service health |
 | `/login` | `GET` | browser | Start AkurAI IDP login |
-| `/admin` | `GET` | SSO | Provider and model admin |
+| `/admin` | `GET` | SSO | Provider, model, user, key, and cost admin |
 | `/v1/models` | `GET` | bearer key | OpenAI-compatible model list |
 | `/v1/chat/completions` | `POST` | bearer key | OpenAI-compatible chat |
 | `/v1/responses` | `POST` | bearer key | Codex Responses passthrough |
@@ -230,11 +232,29 @@ id|name|enabled|auth_path
 `/v1/models` returns provider-prefixed IDs. Store model rows with the bare
 provider-local ID unless you intentionally want a custom public alias.
 
+Admin/accounting files are stored under `AKURAI_ROUTER_HOME`:
+
+```text
+users.conf         # idp email, display name, enabled flag, cost share
+client_keys.conf   # generated router keys and owners
+billing.conf       # shared monthly cost
+usage.tsv          # per-request usage and upstream cost ledger
+```
+
 ## Admin Panel
 
 The admin panel is available at `/admin` and requires AkurAI IDP SSO. The router
 checks the `userinfo.email` value against `AKURAI_ROUTER_ADMIN_EMAIL` before
-showing provider configuration.
+showing configuration.
+
+The dashboard supports provider auth path configuration, model catalog
+management, IDP user records by email, per-user router API key creation and
+revocation, usage totals by user, direct upstream cost totals when the provider
+returns `cost`, and monthly shared-cost allocation by user share percentage.
+
+Generated router keys are shown once after creation. Store them in the client
+secret manager and send them as `Authorization: Bearer ...`. The global
+`AKURAI_ROUTER_API_KEY` still works and is attributed to the admin email.
 
 Register an IDP client with the callback URL printed by:
 
@@ -274,6 +294,7 @@ TLS reverse proxy -> 127.0.0.1:4219 -> akurai-router -> provider OAuth upstreams
 - Do not expose `/v1/*` without `AKURAI_ROUTER_API_KEY`.
 - Do not commit `router.conf`, `/etc/akurai-router/router.env`, OAuth files, or
   copied credentials.
+- Do not commit `client_keys.conf`; it contains generated router API keys.
 - Keep `~/.codex/auth.json`, `~/.claude/.credentials.json`, and
   `~/.local/share/opencode/auth.json` readable only by the service account.
 - Use HTTPS for public deployments.

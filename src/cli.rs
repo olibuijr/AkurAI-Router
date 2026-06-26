@@ -1,6 +1,7 @@
 use std::env;
 use std::path::PathBuf;
 
+use crate::accounts;
 use crate::auth;
 use crate::config::{
     Config, Model, PROVIDER_CLAUDE, PROVIDER_CODEX, PROVIDER_OPENCODE_GO, Provider,
@@ -39,6 +40,7 @@ pub fn run() -> Result<(), String> {
 fn serve() -> Result<(), String> {
     let cfg = Config::load()?;
     ensure_default_files(&cfg)?;
+    accounts::ensure_account_files(&cfg)?;
     cfg.validate_for_serve()?;
     let addr = cfg.listen_addr.clone();
     http::serve(&addr, move |req, stream| dispatch(req, stream, &cfg))
@@ -61,7 +63,7 @@ fn dispatch(req: Request, stream: &mut std::net::TcpStream, cfg: &Config) {
         ("GET", "/admin") => landing::admin(&req, stream, cfg),
         ("POST", p) if p.starts_with("/admin/") => landing::admin_post(&req, stream, cfg),
         ("GET", "/v1/models") | ("GET", "/api/v1/models") => {
-            if !auth::check_api_key(&req, cfg) {
+            if auth::authenticate_api_key(&req, cfg).is_none() {
                 let _ =
                     http::send_json(stream, 401, "{\"error\":{\"message\":\"invalid API key\"}}");
                 return;
@@ -74,12 +76,12 @@ fn dispatch(req: Request, stream: &mut std::net::TcpStream, cfg: &Config) {
         | ("POST", "/codex")
         | ("POST", "/v1/chat/completions")
         | ("POST", "/api/v1/chat/completions") => {
-            if !auth::check_api_key(&req, cfg) {
+            let Some(actor) = auth::authenticate_api_key(&req, cfg) else {
                 let _ =
                     http::send_json(stream, 401, "{\"error\":{\"message\":\"invalid API key\"}}");
                 return;
-            }
-            upstream::forward_model(&req, stream, cfg);
+            };
+            upstream::forward_model(&req, stream, cfg, &actor);
         }
         _ => {
             let _ = http::send_text(stream, 404, "text/plain", "not found");
@@ -91,6 +93,7 @@ fn init() -> Result<(), String> {
     let cfg = Config::load()?;
     let path = write_local_env_template(&cfg)?;
     ensure_default_files(&cfg)?;
+    accounts::ensure_account_files(&cfg)?;
     println!("wrote {}", path.display());
     Ok(())
 }

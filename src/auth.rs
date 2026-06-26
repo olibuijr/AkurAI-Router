@@ -1,6 +1,7 @@
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 
+use crate::accounts;
 use crate::config::Config;
 use crate::http::Request;
 use crate::util::{now_secs, random_hex};
@@ -15,12 +16,29 @@ pub struct AdminSession {
     pub expires_at: u64,
 }
 
-pub fn check_api_key(req: &Request, cfg: &Config) -> bool {
+#[derive(Clone, Debug)]
+pub struct ApiActor {
+    pub email: String,
+    pub key_id: String,
+}
+
+pub fn authenticate_api_key(req: &Request, cfg: &Config) -> Option<ApiActor> {
     let Some(auth) = req.header("authorization") else {
-        return false;
+        return None;
     };
     let token = auth.strip_prefix("Bearer ").unwrap_or(auth).trim();
-    constant_time_eq(token.as_bytes(), cfg.api_key.as_bytes())
+    if !cfg.api_key.is_empty() && constant_time_eq(token.as_bytes(), cfg.api_key.as_bytes()) {
+        return Some(ApiActor {
+            email: cfg.admin_allowed_email.clone(),
+            key_id: "global".to_string(),
+        });
+    }
+    let key = accounts::find_client_key(cfg, token)?;
+    accounts::touch_client_key(cfg, &key.id);
+    Some(ApiActor {
+        email: key.email,
+        key_id: key.id,
+    })
 }
 
 pub fn create_oauth_state(cfg: &Config) -> Result<String, String> {
