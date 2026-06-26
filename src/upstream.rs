@@ -261,33 +261,84 @@ fn chat_to_responses(value: Json, cfg: &Config) -> Result<Json, String> {
             .get_str("role")
             .unwrap_or("user")
             .replace("system", "developer");
-        let text = match msg.get("content") {
-            Some(Json::String(s)) => s.clone(),
-            Some(Json::Array(parts)) => parts
-                .iter()
-                .filter_map(|part| part.get_str("text"))
-                .collect::<Vec<_>>()
-                .join("\n"),
-            _ => String::new(),
-        };
+        let parts = chat_content_to_parts(msg.get("content"));
         let mut item = Json::object();
         item.set("type", Json::String("message".to_string()));
         item.set("role", Json::String(role));
-        let mut content = Json::object();
-        content.set("type", Json::String("input_text".to_string()));
-        content.set(
-            "text",
-            Json::String(if text.is_empty() {
-                "...".to_string()
-            } else {
-                text
-            }),
-        );
-        item.set("content", Json::Array(vec![content]));
+        item.set("content", Json::Array(parts));
         input.push(item);
     }
     out.set("input", Json::Array(input));
     Ok(out)
+}
+
+/// Convert an OpenAI chat-completions `content` field into Responses-API content
+/// parts. Text is preserved as `input_text`; images are forwarded as
+/// `input_image` (previously every non-text part was silently dropped, so the
+/// upstream model never saw screenshots).
+fn chat_content_to_parts(content: Option<&Json>) -> Vec<Json> {
+    let mut parts = Vec::new();
+    match content {
+        Some(Json::String(s)) => parts.push(input_text_part(s)),
+        Some(Json::Array(items)) => {
+            for part in items {
+                let kind = part.get_str("type").unwrap_or("");
+                if kind == "image_url" || part.get("image_url").is_some() {
+                    if let Some(image) = input_image_part(part) {
+                        parts.push(image);
+                    }
+                } else if let Some(text) = part.get_str("text") {
+                    if !text.is_empty() {
+                        parts.push(input_text_part(text));
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    if parts.is_empty() {
+        parts.push(input_text_part("..."));
+    }
+    parts
+}
+
+fn input_text_part(text: &str) -> Json {
+    let mut content = Json::object();
+    content.set("type", Json::String("input_text".to_string()));
+    content.set(
+        "text",
+        Json::String(if text.is_empty() {
+            "...".to_string()
+        } else {
+            text.to_string()
+        }),
+    );
+    content
+}
+
+/// Map an OpenAI `{"type":"image_url","image_url":{"url":...,"detail":...}}`
+/// part (or the bare-string `image_url` form) to a Responses-API `input_image`
+/// content item. Accepts `https://` URLs and `data:` URIs (e.g. screenshots).
+fn input_image_part(part: &Json) -> Option<Json> {
+    let (url, detail) = match part.get("image_url") {
+        Some(Json::String(s)) => (s.clone(), None),
+        Some(obj @ Json::Object(_)) => (
+            obj.get_str("url")?.to_string(),
+            obj.get_str("detail").map(|s| s.to_string()),
+        ),
+        _ => return None,
+    };
+    if url.is_empty() {
+        return None;
+    }
+    let mut content = Json::object();
+    content.set("type", Json::String("input_image".to_string()));
+    content.set("image_url", Json::String(url));
+    content.set(
+        "detail",
+        Json::String(detail.unwrap_or_else(|| "auto".to_string())),
+    );
+    Some(content)
 }
 
 fn normalize_codex_body(body: &mut Json, cfg: &Config) -> Result<(), String> {
@@ -604,4 +655,56 @@ fn error_json(message: &str) -> String {
     let mut root = Json::object();
     root.set("error", err);
     root.stringify()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn forwards_image_url_as_input_image() {
+        let content = json::parse(
+            r#"[{"type":"text","text":"what is this"},{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA","detail":"high"}}]"#,
+        )
+        .unwrap();
+        let parts = chat_content_to_parts(Some(&content));
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0].get_str("type"), Some("input_text"));
+        assert_eq!(parts[0].get_str("text"), Some("what is this"));
+        assert_eq!(parts[1].get_str("type"), Some("input_image"));
+        assert_eq!(
+            parts[1].get_str("image_url"),
+            Some("data:image/png;base64,AAAA")
+        );
+        assert_eq!(parts[1].get_str("detail"), Some("high"));
+    }
+
+    #[test]
+    fn image_only_content_has_no_filler_text() {
+        let content = json::parse(
+            r#"[{"type":"image_url","image_url":{"url":"https://example.com/a.png"}}]"#,
+        )
+        .unwrap();
+        let parts = chat_content_to_parts(Some(&content));
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].get_str("type"), Some("input_image"));
+        assert_eq!(parts[0].get_str("detail"), Some("auto"));
+    }
+
+    #[test]
+    fn string_content_is_single_text_part() {
+        let content = Json::String("hello".to_string());
+        let parts = chat_content_to_parts(Some(&content));
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].get_str("type"), Some("input_text"));
+        assert_eq!(parts[0].get_str("text"), Some("hello"));
+    }
+
+    #[test]
+    fn empty_content_falls_back_to_placeholder() {
+        let parts = chat_content_to_parts(None);
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].get_str("type"), Some("input_text"));
+        assert_eq!(parts[0].get_str("text"), Some("..."));
+    }
 }
