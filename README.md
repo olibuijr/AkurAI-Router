@@ -10,6 +10,11 @@ It serves:
 - `POST /v1/responses` Codex Responses API proxy
 - `POST /v1/chat/completions` best-effort Chat Completions to Responses proxy
 
+Both `/v1` chat/responses endpoints accept **multimodal input**: OpenAI
+`image_url` content parts (object `{url, detail}` or bare string; `data:` URIs and
+`https://` URLs) are forwarded upstream as Responses-API `input_image`, so
+vision / computer-use requests reach the model with their images intact.
+
 The API surface uses a private bearer key for tooling. The admin UI uses AkurAI IDP SSO and only allows `olibuijr@olibuijr.com` by default.
 
 ## Design
