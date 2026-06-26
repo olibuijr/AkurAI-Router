@@ -93,7 +93,7 @@ akurai-router providers enable [ID]
 akurai-router providers disable [ID]
 akurai-router models list
 akurai-router models add gpt-5.4-mini "GPT 5.4 Mini" gpt-5.4-mini codex
-akurai-router models add claude-sonnet-4-6 "Claude Sonnet 4.6" claude-sonnet-4-6 claude
+akurai-router models add claude-opus-4-8 "Claude Opus 4.8" claude-opus-4-8 claude
 akurai-router models remove gpt-5.4-mini
 akurai-router idp client-json
 ```
@@ -105,7 +105,7 @@ Configure OpenAI-compatible tools with:
 ```text
 Base URL: https://akurai-router.olibuijr.com/v1
 API key: the value of AKURAI_ROUTER_API_KEY
-Model: gpt-5.4-mini or claude-sonnet-4-6
+Model: gpt-5.4-mini or claude-opus-4-8
 ```
 
 Codex CLI should use `wire_api = "responses"` for this endpoint.

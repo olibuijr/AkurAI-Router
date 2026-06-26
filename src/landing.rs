@@ -309,6 +309,9 @@ fn merge_remote_models(cfg: &Config, text: &str) {
         let Some(id) = item.get_str("id").or_else(|| item.get_str("name")) else {
             continue;
         };
+        if skip_remote_model(id) {
+            continue;
+        }
         if models.iter().any(|m| m.id == id) {
             continue;
         }
@@ -325,6 +328,10 @@ fn merge_remote_models(cfg: &Config, text: &str) {
         });
     }
     let _ = save_models(cfg, &models);
+}
+
+fn skip_remote_model(id: &str) -> bool {
+    id == "claude-fable-5"
 }
 
 pub fn logout(req: &Request, stream: &mut TcpStream, cfg: &Config) {
