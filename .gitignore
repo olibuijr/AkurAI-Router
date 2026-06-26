@@ -1,0 +1,4 @@
+/target/
+/.akurai-router/
+*.env
+!.env.example
