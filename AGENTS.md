@@ -21,6 +21,7 @@ AkurAI Router is a standalone, std-only Rust OpenAI-compatible router. It expose
 - Env file: `/etc/akurai-router/router.env`
 - Runtime data: `/var/lib/akurai-router`
 - Codex OAuth source: `/home/ubuntu/.codex/auth.json`
+- Claude Code OAuth source: `/home/olafurbui/.claude/.credentials.json` on the source machine; mirror the file onto the router host before enabling the provider
 - AkurAI IDP issuer: `https://auth.olibuijr.com`
 - Admin allowlist: `olibuijr@olibuijr.com`
 
@@ -29,5 +30,6 @@ AkurAI Router is a standalone, std-only Rust OpenAI-compatible router. It expose
 - Keep `Cargo.toml` free of dependencies; the binary must remain Rust `std` only.
 - TLS terminates at nginx. Outbound HTTPS uses host `curl` because std has no TLS.
 - Do not commit API keys, IDP client secrets, Codex tokens, or VM env files.
+- Default providers are `codex` and `claude`; model ownership is recorded in `models.conf`.
 - Admin UI login must go through AkurAI IDP and verify `userinfo.email` against the allowlist before serving `/admin`.
 - `/v1/*` endpoints must require `Authorization: Bearer <AKURAI_ROUTER_API_KEY>`.

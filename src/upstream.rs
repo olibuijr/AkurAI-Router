@@ -4,12 +4,15 @@ use std::net::TcpStream;
 use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Stdio};
 
-use crate::config::{Config, load_models};
+use crate::config::{Config, load_models, load_providers};
 use crate::http;
 use crate::json::{self, Json};
 use crate::util::{base64_url_decode, now_secs};
 
 const DEFAULT_CODEX_INSTRUCTIONS: &str = "You are Codex, a focused software engineering agent. Answer accurately, preserve user intent, and use tools only when provided by the client.";
+const DEFAULT_CLAUDE_SYSTEM_PROMPT: &str =
+    "You are Claude Code, Anthropic's official CLI for Claude.";
+const DEFAULT_CLAUDE_MAX_TOKENS: u64 = 64_000;
 
 #[derive(Clone, Debug)]
 pub struct CurlResponse {
@@ -24,19 +27,41 @@ struct CodexAuth {
     account_id: String,
 }
 
+#[derive(Clone, Debug)]
+struct ClaudeAuth {
+    access_token: String,
+}
+
 pub fn models_json(cfg: &Config) -> String {
     let mut data = Vec::new();
     for model in load_models(cfg).into_iter().filter(|m| m.enabled) {
         let mut obj = Json::object();
         obj.set("id", Json::String(model.id));
         obj.set("object", Json::String("model".to_string()));
-        obj.set("owned_by", Json::String("codex".to_string()));
+        obj.set("owned_by", Json::String(model.provider_id));
         data.push(obj);
     }
     let mut root = Json::object();
     root.set("object", Json::String("list".to_string()));
     root.set("data", Json::Array(data));
     root.stringify()
+}
+
+pub fn forward_model(req: &http::Request, stream: &mut TcpStream, cfg: &Config) {
+    let provider_id = request_provider_id(req, cfg);
+    if !provider_enabled(cfg, &provider_id) {
+        let _ = http::send_json(
+            stream,
+            503,
+            &error_json(&format!("provider `{provider_id}` is disabled")),
+        );
+        return;
+    }
+    if provider_id == "claude" {
+        forward_claude(req, stream, cfg);
+    } else {
+        forward_codex(req, stream, cfg);
+    }
 }
 
 pub fn forward_codex(req: &http::Request, stream: &mut TcpStream, cfg: &Config) {
@@ -81,6 +106,96 @@ pub fn forward_codex(req: &http::Request, stream: &mut TcpStream, cfg: &Config) 
     }
 }
 
+fn forward_claude(req: &http::Request, stream: &mut TcpStream, cfg: &Config) {
+    let body = match transform_claude_request(&req.body, cfg) {
+        Ok(body) => body,
+        Err(e) => {
+            let _ = http::send_json(stream, 400, &error_json(&e));
+            return;
+        }
+    };
+
+    let auth = match load_or_refresh_claude_auth(cfg) {
+        Ok(a) => a,
+        Err(e) => {
+            let _ = http::send_json(stream, 502, &error_json(&e));
+            return;
+        }
+    };
+
+    let session_id = req
+        .header("x-session-id")
+        .or_else(|| req.header("session_id"))
+        .unwrap_or("akurai-router")
+        .to_string();
+    let headers = vec![
+        ("Content-Type".to_string(), "application/json".to_string()),
+        ("Accept".to_string(), "application/json".to_string()),
+        (
+            "Authorization".to_string(),
+            format!("Bearer {}", auth.access_token),
+        ),
+        (
+            "Anthropic-Version".to_string(),
+            "2023-06-01".to_string(),
+        ),
+        (
+            "Anthropic-Beta".to_string(),
+            "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05,advanced-tool-use-2025-11-20,effort-2025-11-24,structured-outputs-2025-12-15,fast-mode-2026-02-01,redact-thinking-2026-02-12,token-efficient-tools-2026-03-28".to_string(),
+        ),
+        (
+            "Anthropic-Dangerous-Direct-Browser-Access".to_string(),
+            "true".to_string(),
+        ),
+        ("User-Agent".to_string(), "claude-cli/2.1.92 (external, sdk-cli)".to_string()),
+        ("X-App".to_string(), "cli".to_string()),
+        ("X-Stainless-Helper-Method".to_string(), "stream".to_string()),
+        ("X-Stainless-Retry-Count".to_string(), "0".to_string()),
+        ("X-Stainless-Runtime-Version".to_string(), "v24.14.0".to_string()),
+        ("X-Stainless-Package-Version".to_string(), "0.80.0".to_string()),
+        ("X-Stainless-Runtime".to_string(), "node".to_string()),
+        ("X-Stainless-Lang".to_string(), "js".to_string()),
+        ("X-Stainless-Arch".to_string(), runtime_arch().to_string()),
+        ("X-Stainless-Os".to_string(), runtime_os().to_string()),
+        ("X-Stainless-Timeout".to_string(), "600".to_string()),
+        ("X-Session-Id".to_string(), session_id),
+    ];
+    let headers_ref: Vec<(&str, String)> = headers
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.clone()))
+        .collect();
+    match curl_capture(
+        "POST",
+        &cfg.claude_messages_url,
+        &headers_ref,
+        body.as_bytes(),
+        900,
+    ) {
+        Ok(resp) => {
+            if resp.status != 200 {
+                let _ = http::send_json(
+                    stream,
+                    resp.status,
+                    &error_json(&String::from_utf8_lossy(&resp.body)),
+                );
+                return;
+            }
+            let text = String::from_utf8_lossy(&resp.body);
+            match claude_to_openai_response(&text, cfg) {
+                Ok(json) => {
+                    let _ = http::send_json(stream, 200, &json);
+                }
+                Err(e) => {
+                    let _ = http::send_json(stream, 502, &error_json(&e));
+                }
+            }
+        }
+        Err(e) => {
+            let _ = http::send_json(stream, 502, &error_json(&e));
+        }
+    }
+}
+
 pub fn fetch_codex_models(cfg: &Config) -> Result<CurlResponse, String> {
     let auth = load_or_refresh_codex_auth(cfg)?;
     let mut headers = vec![
@@ -93,6 +208,17 @@ pub fn fetch_codex_models(cfg: &Config) -> Result<CurlResponse, String> {
         headers.push(("chatgpt-account-id", auth.account_id));
     }
     curl_capture("GET", &cfg.codex_models_url, &headers, b"", 30)
+}
+
+pub fn fetch_claude_models(cfg: &Config) -> Result<CurlResponse, String> {
+    let auth = load_or_refresh_claude_auth(cfg)?;
+    let headers = vec![
+        ("Accept", "application/json".to_string()),
+        ("Authorization", format!("Bearer {}", auth.access_token)),
+        ("Anthropic-Version", "2023-06-01".to_string()),
+        ("Anthropic-Beta", "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05,advanced-tool-use-2025-11-20,effort-2025-11-24,structured-outputs-2025-12-15,fast-mode-2026-02-01,redact-thinking-2026-02-12,token-efficient-tools-2026-03-28".to_string()),
+    ];
+    curl_capture("GET", &cfg.claude_models_url, &headers, b"", 30)
 }
 
 pub fn curl_capture(
@@ -399,6 +525,256 @@ fn normalize_codex_body(body: &mut Json, cfg: &Config) -> Result<(), String> {
     Ok(())
 }
 
+fn transform_claude_request(raw: &[u8], cfg: &Config) -> Result<String, String> {
+    let input = json::parse(&String::from_utf8_lossy(raw))?;
+    let mut body = Json::object();
+    let model = input
+        .get_str("model")
+        .unwrap_or(&cfg.default_model)
+        .trim_start_matches("cc/")
+        .to_string();
+    body.set(
+        "model",
+        Json::String(resolve_model_id_for_provider(cfg, &model, "claude")),
+    );
+    body.set(
+        "max_tokens",
+        Json::Number(
+            number_from_json(input.get("max_tokens"))
+                .unwrap_or(DEFAULT_CLAUDE_MAX_TOKENS)
+                .to_string(),
+        ),
+    );
+    body.set("stream", Json::Bool(false));
+    if let Some(v) = input.get("temperature") {
+        body.set("temperature", v.clone());
+    }
+    let (system_blocks, messages) = claude_messages_from_openai(&input);
+    body.set("messages", Json::Array(messages));
+    if system_blocks.is_empty() {
+        body.set(
+            "system",
+            Json::Array(vec![claude_text_block(DEFAULT_CLAUDE_SYSTEM_PROMPT)]),
+        );
+    } else {
+        body.set("system", Json::Array(system_blocks));
+    }
+    if let Some(v) = input.get("top_p") {
+        body.set("top_p", v.clone());
+    }
+    Ok(body.stringify())
+}
+
+fn claude_messages_from_openai(input: &Json) -> (Vec<Json>, Vec<Json>) {
+    let mut system_blocks = vec![claude_text_block(DEFAULT_CLAUDE_SYSTEM_PROMPT)];
+    let mut messages = Vec::new();
+
+    if let Some(Json::Array(values)) = input.get("messages") {
+        let mut current_role: Option<String> = None;
+        let mut current_text = String::new();
+        for msg in values {
+            let role = msg.get_str("role").unwrap_or("user");
+            let text = extract_openai_text(msg.get("content"));
+            if role == "system" {
+                if !text.trim().is_empty() {
+                    system_blocks.push(claude_text_block(&text));
+                }
+                continue;
+            }
+            let normalized = if role == "assistant" {
+                "assistant"
+            } else {
+                "user"
+            };
+            if current_role.as_deref() != Some(normalized) {
+                if let Some(prev_role) = current_role.take() {
+                    push_claude_message(&mut messages, &prev_role, current_text.clone());
+                }
+                current_role = Some(normalized.to_string());
+                current_text.clear();
+            }
+            if !text.is_empty() {
+                if !current_text.is_empty() {
+                    current_text.push('\n');
+                }
+                current_text.push_str(&text);
+            }
+        }
+        if let Some(prev_role) = current_role {
+            push_claude_message(&mut messages, &prev_role, current_text);
+        }
+    } else if let Some(input_value) = input.get("input") {
+        let text = extract_openai_text(Some(input_value));
+        push_claude_message(&mut messages, "user", text);
+    }
+
+    if messages.is_empty() {
+        push_claude_message(&mut messages, "user", "...".to_string());
+    }
+    (system_blocks, messages)
+}
+
+fn push_claude_message(messages: &mut Vec<Json>, role: &str, text: String) {
+    if text.trim().is_empty() {
+        return;
+    }
+    let mut item = Json::object();
+    item.set(
+        "role",
+        Json::String(if role == "assistant" {
+            "assistant".to_string()
+        } else {
+            "user".to_string()
+        }),
+    );
+    item.set("content", Json::Array(vec![claude_text_block(&text)]));
+    messages.push(item);
+}
+
+fn extract_openai_text(value: Option<&Json>) -> String {
+    match value {
+        Some(Json::String(text)) => text.clone(),
+        Some(Json::Array(parts)) => parts
+            .iter()
+            .filter_map(|part| part.get_str("text"))
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Some(Json::Object(_)) => value
+            .and_then(|v| v.get_str("text"))
+            .unwrap_or("")
+            .to_string(),
+        _ => String::new(),
+    }
+}
+
+fn claude_text_block(text: &str) -> Json {
+    let mut block = Json::object();
+    block.set("type", Json::String("text".to_string()));
+    block.set("text", Json::String(text.to_string()));
+    block
+}
+
+fn claude_to_openai_response(raw: &str, cfg: &Config) -> Result<String, String> {
+    let parsed = json::parse(raw)?;
+    let mut root = Json::object();
+    root.set(
+        "id",
+        Json::String(
+            parsed
+                .get_str("id")
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| format!("chatcmpl-{}", now_secs())),
+        ),
+    );
+    root.set("object", Json::String("chat.completion".to_string()));
+    root.set("created", Json::Number(now_secs().to_string()));
+    root.set(
+        "model",
+        Json::String(
+            parsed
+                .get_str("model")
+                .unwrap_or(&cfg.default_model)
+                .to_string(),
+        ),
+    );
+    let mut choice = Json::object();
+    choice.set("index", Json::Number("0".to_string()));
+    choice.set(
+        "finish_reason",
+        Json::String(map_claude_finish_reason(parsed.get_str("stop_reason"))),
+    );
+    let mut message = Json::object();
+    message.set("role", Json::String("assistant".to_string()));
+    message.set("content", Json::String(claude_response_text(&parsed)));
+    choice.set("message", message);
+    root.set("choices", Json::Array(vec![choice]));
+
+    let mut usage = Json::object();
+    if let Some(u) = parsed.get("usage") {
+        if let Some(input_tokens) = json_number_string(u.get("input_tokens")) {
+            usage.set("prompt_tokens", Json::Number(input_tokens));
+        }
+        if let Some(output_tokens) = json_number_string(u.get("output_tokens")) {
+            usage.set("completion_tokens", Json::Number(output_tokens));
+        }
+    }
+    let prompt_tokens = json_number_string(usage.get("prompt_tokens"));
+    let completion_tokens = json_number_string(usage.get("completion_tokens"));
+    if let (Some(p), Some(c)) = (prompt_tokens, completion_tokens) {
+        if let (Ok(pn), Ok(cn)) = (p.parse::<u64>(), c.parse::<u64>()) {
+            usage.set("total_tokens", Json::Number((pn + cn).to_string()));
+        }
+    }
+    root.set("usage", usage);
+    Ok(root.stringify())
+}
+
+fn claude_response_text(parsed: &Json) -> String {
+    match parsed.get("content") {
+        Some(Json::Array(parts)) => parts
+            .iter()
+            .filter_map(|part| part.get_str("text"))
+            .collect::<Vec<_>>()
+            .join(""),
+        _ => String::new(),
+    }
+}
+
+fn map_claude_finish_reason(reason: Option<&str>) -> String {
+    match reason.unwrap_or("end_turn") {
+        "end_turn" => "stop".to_string(),
+        "max_tokens" => "length".to_string(),
+        "tool_use" => "tool_calls".to_string(),
+        "stop_sequence" => "stop".to_string(),
+        _ => "stop".to_string(),
+    }
+}
+
+fn json_number_string(value: Option<&Json>) -> Option<String> {
+    match value? {
+        Json::Number(n) => Some(n.clone()),
+        Json::String(s) if !s.is_empty() => Some(s.clone()),
+        _ => None,
+    }
+}
+
+fn number_from_json(value: Option<&Json>) -> Option<u64> {
+    match value? {
+        Json::Number(n) => n.parse().ok(),
+        Json::String(s) => s.parse().ok(),
+        _ => None,
+    }
+}
+
+fn resolve_model_id_for_provider(cfg: &Config, model: &str, provider_id: &str) -> String {
+    for configured in load_models(cfg) {
+        if configured.id == model && configured.provider_id == provider_id {
+            return configured.upstream_id;
+        }
+    }
+    model.to_string()
+}
+
+fn runtime_os() -> &'static str {
+    match std::env::consts::OS {
+        "linux" => "Linux",
+        "macos" => "MacOS",
+        "windows" => "Windows",
+        "freebsd" => "FreeBSD",
+        other => other,
+    }
+}
+
+fn runtime_arch() -> &'static str {
+    match std::env::consts::ARCH {
+        "x86_64" => "x64",
+        "aarch64" => "arm64",
+        "x86" => "x86",
+        other => other,
+    }
+}
+
 fn normalize_input(body: &mut Json) {
     match body.get("input") {
         Some(Json::Array(values)) if !values.is_empty() => {}
@@ -491,6 +867,37 @@ fn resolve_model_id(cfg: &Config, model: &str) -> String {
     id
 }
 
+fn request_provider_id(req: &http::Request, cfg: &Config) -> String {
+    let raw = String::from_utf8_lossy(&req.body);
+    if let Ok(root) = json::parse(&raw) {
+        if let Some(model) = root.get_str("model") {
+            return provider_for_model(cfg, model);
+        }
+    }
+    provider_for_model(cfg, &cfg.default_model)
+}
+
+fn provider_for_model(cfg: &Config, model: &str) -> String {
+    for configured in load_models(cfg) {
+        if configured.id == model {
+            return configured.provider_id;
+        }
+    }
+    if model.starts_with("claude-") || model.starts_with("cc/claude-") {
+        "claude".to_string()
+    } else {
+        "codex".to_string()
+    }
+}
+
+fn provider_enabled(cfg: &Config, provider_id: &str) -> bool {
+    load_providers(cfg)
+        .into_iter()
+        .find(|p| p.id == provider_id)
+        .map(|p| p.enabled)
+        .unwrap_or(true)
+}
+
 fn load_or_refresh_codex_auth(cfg: &Config) -> Result<CodexAuth, String> {
     let mut root = read_codex_auth(cfg)?;
     let mut auth = extract_codex_auth(&root)?;
@@ -511,6 +918,21 @@ fn read_codex_auth(cfg: &Config) -> Result<Json, String> {
         )
     })?;
     json::parse(&text).map_err(|e| format!("failed to parse Codex auth JSON: {e}"))
+}
+
+fn load_or_refresh_claude_auth(cfg: &Config) -> Result<ClaudeAuth, String> {
+    let root = read_claude_auth(cfg)?;
+    extract_claude_auth(&root)
+}
+
+fn read_claude_auth(cfg: &Config) -> Result<Json, String> {
+    let text = fs::read_to_string(&cfg.claude_auth_path).map_err(|e| {
+        format!(
+            "failed to read Claude auth at {}: {e}",
+            cfg.claude_auth_path.display()
+        )
+    })?;
+    json::parse(&text).map_err(|e| format!("failed to parse Claude auth JSON: {e}"))
 }
 
 fn write_codex_auth(cfg: &Config, root: &Json) -> Result<(), String> {
@@ -544,6 +966,19 @@ fn extract_codex_auth(root: &Json) -> Result<CodexAuth, String> {
         refresh_token,
         account_id,
     })
+}
+
+fn extract_claude_auth(root: &Json) -> Result<ClaudeAuth, String> {
+    let oauth = root
+        .get("claudeAiOauth")
+        .ok_or_else(|| "Claude auth missing claudeAiOauth object".to_string())?;
+    let access_token = oauth.get_str("accessToken").unwrap_or("").to_string();
+    if access_token.is_empty() {
+        return Err(
+            "Claude auth missing accessToken; run `claude` on the source machine".to_string(),
+        );
+    }
+    Ok(ClaudeAuth { access_token })
 }
 
 fn token_expiring_soon(access_token: &str) -> bool {

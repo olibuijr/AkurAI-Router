@@ -77,7 +77,7 @@ fn dispatch(req: Request, stream: &mut std::net::TcpStream, cfg: &Config) {
                     http::send_json(stream, 401, "{\"error\":{\"message\":\"invalid API key\"}}");
                 return;
             }
-            upstream::forward_codex(&req, stream, cfg);
+            upstream::forward_model(&req, stream, cfg);
         }
         _ => {
             let _ = http::send_text(stream, 404, "text/plain", "not found");
@@ -121,38 +121,50 @@ fn providers(args: &[String]) -> Result<(), String> {
         }
         Some("add") => {
             let id = args.get(1).map(|s| s.as_str()).unwrap_or("codex");
-            if id != "codex" {
-                return Err("this minimal port only supports the codex provider".to_string());
+            if id != "codex" && id != "claude" {
+                return Err("provider id must be codex or claude".to_string());
             }
             let auth_path = args
                 .iter()
                 .position(|s| s == "--auth-path")
                 .and_then(|i| args.get(i + 1))
                 .map(PathBuf::from)
-                .unwrap_or_else(|| cfg.codex_auth_path.clone());
+                .unwrap_or_else(|| match id {
+                    "claude" => cfg.claude_auth_path.clone(),
+                    _ => cfg.codex_auth_path.clone(),
+                });
             let mut providers = load_providers(&cfg);
-            providers.retain(|p| p.id != "codex");
+            providers.retain(|p| p.id != id);
             providers.push(Provider {
-                id: "codex".to_string(),
-                name: "OpenAI Codex".to_string(),
+                id: id.to_string(),
+                name: if id == "claude" {
+                    "Claude Code".to_string()
+                } else {
+                    "OpenAI Codex".to_string()
+                },
                 enabled: true,
                 auth_path,
             });
             save_providers(&cfg, &providers)
         }
-        Some("disable") => set_provider_enabled(&cfg, false),
-        Some("enable") => set_provider_enabled(&cfg, true),
+        Some("disable") => set_provider_enabled(&cfg, false, args.get(1).map(|s| s.as_str())),
+        Some("enable") => set_provider_enabled(&cfg, true, args.get(1).map(|s| s.as_str())),
         _ => Err(
-            "usage: akurai-router providers [list|add codex --auth-path PATH|enable|disable]"
+            "usage: akurai-router providers [list|add codex|claude --auth-path PATH|enable [ID]|disable [ID]]"
                 .to_string(),
         ),
     }
 }
 
-fn set_provider_enabled(cfg: &Config, enabled: bool) -> Result<(), String> {
+fn set_provider_enabled(
+    cfg: &Config,
+    enabled: bool,
+    provider_id: Option<&str>,
+) -> Result<(), String> {
     let mut providers = load_providers(cfg);
+    let target = provider_id.unwrap_or("codex");
     for provider in &mut providers {
-        if provider.id == "codex" {
+        if provider.id == target {
             provider.enabled = enabled;
         }
     }
@@ -166,10 +178,11 @@ fn models(args: &[String]) -> Result<(), String> {
         Some("list") | None => {
             for m in load_models(&cfg) {
                 println!(
-                    "{}\t{}\t{}\t{}",
+                    "{}\t{}\t{}\t{}\t{}",
                     m.id,
                     m.name,
                     m.upstream_id,
+                    m.provider_id,
                     if m.enabled { "enabled" } else { "disabled" }
                 );
             }
@@ -179,12 +192,20 @@ fn models(args: &[String]) -> Result<(), String> {
             let id = args.get(1).ok_or_else(|| "model id required".to_string())?.clone();
             let name = args.get(2).cloned().unwrap_or_else(|| id.clone());
             let upstream_id = args.get(3).cloned().unwrap_or_else(|| id.clone());
+            let provider_id = args.get(4).cloned().unwrap_or_else(|| {
+                if id.starts_with("claude-") || id.starts_with("cc/claude-") {
+                    "claude".to_string()
+                } else {
+                    "codex".to_string()
+                }
+            });
             let mut models = load_models(&cfg);
             models.retain(|m| m.id != id);
             models.push(Model {
                 id,
                 name,
                 upstream_id,
+                provider_id,
                 enabled: true,
             });
             save_models(&cfg, &models)
@@ -206,7 +227,7 @@ fn models(args: &[String]) -> Result<(), String> {
             }
             save_models(&cfg, &models)
         }
-        _ => Err("usage: akurai-router models [list|add ID [NAME] [UPSTREAM]|remove ID|enable ID|disable ID]".to_string()),
+        _ => Err("usage: akurai-router models [list|add ID [NAME] [UPSTREAM] [PROVIDER]|remove ID|enable ID|disable ID]".to_string()),
     }
 }
 
@@ -250,9 +271,11 @@ Usage:
   akurai-router key generate
   akurai-router providers list
   akurai-router providers add codex --auth-path ~/.codex/auth.json
-  akurai-router providers enable|disable
+  akurai-router providers add claude --auth-path ~/.claude/.credentials.json
+  akurai-router providers enable [ID]
+  akurai-router providers disable [ID]
   akurai-router models list
-  akurai-router models add ID [NAME] [UPSTREAM_ID]
+  akurai-router models add ID [NAME] [UPSTREAM_ID] [PROVIDER_ID]
   akurai-router models remove|enable|disable ID
   akurai-router idp client-json
 
@@ -262,6 +285,7 @@ Environment:
   AKURAI_ROUTER_API_KEY=akr_...
   AKURAI_ROUTER_COOKIE_SECRET=...
   AKURAI_ROUTER_CODEX_AUTH_PATH=/home/ubuntu/.codex/auth.json
+  AKURAI_ROUTER_CLAUDE_AUTH_PATH=/home/olafurbui/.claude/.credentials.json
   AKURAI_ROUTER_IDP_ISSUER=https://auth.olibuijr.com
   AKURAI_ROUTER_IDP_CLIENT_ID=...
   AKURAI_ROUTER_IDP_CLIENT_SECRET=...

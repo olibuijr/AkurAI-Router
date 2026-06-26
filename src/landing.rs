@@ -92,25 +92,52 @@ pub fn admin(req: &Request, stream: &mut TcpStream, cfg: &Config) {
     };
     let providers = load_providers(cfg);
     let models = load_models(cfg);
-    let provider = providers
+    let auth_ok = providers.iter().any(|p| p.enabled && p.auth_path.exists());
+    let provider_rows = providers
         .iter()
-        .find(|p| p.id == "codex")
-        .cloned()
-        .unwrap_or(Provider {
-            id: "codex".to_string(),
-            name: "OpenAI Codex".to_string(),
-            enabled: true,
-            auth_path: cfg.codex_auth_path.clone(),
-        });
-    let auth_ok = provider.auth_path.exists();
+        .map(|p| {
+            let status_class = if p.enabled && p.auth_path.exists() {
+                "pill ok"
+            } else {
+                "pill warn"
+            };
+            let status = if p.enabled && p.auth_path.exists() {
+                "auth found"
+            } else {
+                "auth missing"
+            };
+            format!(
+                r#"<form method="post" action="/admin/provider/save" class="provider-form">
+  <input type="hidden" name="id" value="{}">
+  <div class="provider-main">
+    <strong>{}</strong>
+    <span class="muted">{}</span>
+  </div>
+  <label>Auth path<input name="auth_path" value="{}"></label>
+  <label class="check"><input type="checkbox" name="enabled" {}> Enabled</label>
+  <span class="{}">{}</span>
+  <button>Save</button>
+</form>"#,
+                html_escape(&p.id),
+                html_escape(&p.name),
+                html_escape(&p.id),
+                html_escape(&p.auth_path.display().to_string()),
+                if p.enabled { "checked" } else { "" },
+                status_class,
+                status
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("");
     let model_rows = models
         .iter()
         .map(|m| {
             format!(
-                r#"<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td><form method="post" action="/admin/models/remove"><input type="hidden" name="id" value="{}"><button class="icon" title="Remove">×</button></form></td></tr>"#,
+                r#"<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td><form method="post" action="/admin/models/remove"><input type="hidden" name="id" value="{}"><button class="icon" title="Remove">×</button></form></td></tr>"#,
                 html_escape(&m.id),
                 html_escape(&m.name),
                 html_escape(&m.upstream_id),
+                html_escape(&m.provider_id),
                 if m.enabled { "enabled" } else { "disabled" },
                 html_escape(&m.id),
             )
@@ -130,13 +157,8 @@ pub fn admin(req: &Request, stream: &mut TcpStream, cfg: &Config) {
   </section>
 
   <section class="panel">
-    <h2>Provider</h2>
-    <form method="post" action="/admin/provider/save" class="stack">
-      <label>Codex auth path<input name="auth_path" value="{auth_path}"></label>
-      <label>Default model<input name="default_model" value="{default_model}" disabled></label>
-      <label class="check"><input type="checkbox" name="enabled" {checked}> Enabled</label>
-      <button>Save provider</button>
-    </form>
+    <h2>Providers</h2>
+    <div class="provider-list">{provider_rows}</div>
     <p class="muted">{provider_hint}</p>
   </section>
 
@@ -150,12 +172,13 @@ pub fn admin(req: &Request, stream: &mut TcpStream, cfg: &Config) {
   </section>
 
   <section class="panel wide">
-    <div class="row-head"><h2>Models</h2><form method="post" action="/admin/models/sync"><button>Sync Codex catalog</button></form></div>
-    <table><thead><tr><th>ID</th><th>Name</th><th>Upstream</th><th>Status</th><th></th></tr></thead><tbody>{model_rows}</tbody></table>
+    <div class="row-head"><h2>Models</h2><form method="post" action="/admin/models/sync"><button>Sync provider catalogs</button></form></div>
+    <table><thead><tr><th>ID</th><th>Name</th><th>Upstream</th><th>Provider</th><th>Status</th><th></th></tr></thead><tbody>{model_rows}</tbody></table>
     <form method="post" action="/admin/models/add" class="inline-form">
       <input name="id" placeholder="model id">
       <input name="name" placeholder="display name">
       <input name="upstream_id" placeholder="upstream id">
+      <input name="provider_id" placeholder="provider id">
       <button>Add model</button>
     </form>
   </section>
@@ -168,18 +191,16 @@ pub fn admin(req: &Request, stream: &mut TcpStream, cfg: &Config) {
         base = html_escape(&cfg.public_base_url),
         status_class = if auth_ok { "pill ok" } else { "pill warn" },
         status = if auth_ok {
-            "Codex auth found"
+            "Provider auth found"
         } else {
-            "Codex auth missing"
+            "Provider auth missing"
         },
-        auth_path = html_escape(&provider.auth_path.display().to_string()),
-        default_model = html_escape(&cfg.default_model),
-        checked = if provider.enabled { "checked" } else { "" },
         provider_hint = if auth_ok {
-            "The router will use the Codex OAuth material at this path and refresh access tokens when possible."
+            "Keep each provider auth file readable only by the service account. Claude Code uses ~/.claude/.credentials.json; Codex uses ~/.codex/auth.json."
         } else {
-            "Run codex login for the configured service account or set AKURAI_ROUTER_CODEX_AUTH_PATH to the correct auth.json path."
+            "Point each provider at the correct local OAuth file on the VM. Claude Code uses ~/.claude/.credentials.json; Codex uses ~/.codex/auth.json."
         },
+        provider_rows = provider_rows,
         model_rows = model_rows,
     );
     let _ = http::send_text(stream, 200, "text/html; charset=utf-8", &html);
@@ -198,16 +219,23 @@ pub fn admin_post(req: &Request, stream: &mut TcpStream, cfg: &Config) {
     match req.path.as_str() {
         "/admin/provider/save" => {
             let mut providers = load_providers(cfg);
-            let auth_path = query_get(&form, "auth_path")
-                .unwrap_or_else(|| cfg.codex_auth_path.display().to_string());
+            let id = query_get(&form, "id").unwrap_or_else(|| "codex".to_string());
+            let auth_path = query_get(&form, "auth_path").unwrap_or_else(|| match id.as_str() {
+                "claude" => cfg.claude_auth_path.display().to_string(),
+                _ => cfg.codex_auth_path.display().to_string(),
+            });
             let enabled = query_get(&form, "enabled").is_some();
-            if let Some(provider) = providers.iter_mut().find(|p| p.id == "codex") {
+            if let Some(provider) = providers.iter_mut().find(|p| p.id == id) {
                 provider.enabled = enabled;
                 provider.auth_path = PathBuf::from(auth_path);
             } else {
                 providers.push(Provider {
-                    id: "codex".to_string(),
-                    name: "OpenAI Codex".to_string(),
+                    id: id.clone(),
+                    name: if id == "claude" {
+                        "Claude Code".to_string()
+                    } else {
+                        "OpenAI Codex".to_string()
+                    },
                     enabled,
                     auth_path: PathBuf::from(auth_path),
                 });
@@ -223,12 +251,22 @@ pub fn admin_post(req: &Request, stream: &mut TcpStream, cfg: &Config) {
                 let upstream_id = query_get(&form, "upstream_id")
                     .filter(|s| !s.is_empty())
                     .unwrap_or_else(|| id.clone());
+                let provider_id = query_get(&form, "provider_id")
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| {
+                        if id.starts_with("claude-") || id.starts_with("cc/claude-") {
+                            "claude".to_string()
+                        } else {
+                            "codex".to_string()
+                        }
+                    });
                 let mut models = load_models(cfg);
                 models.retain(|m| m.id != id);
                 models.push(Model {
                     id,
                     name,
                     upstream_id,
+                    provider_id,
                     enabled: true,
                 });
                 let _ = save_models(cfg, &models);
@@ -243,6 +281,11 @@ pub fn admin_post(req: &Request, stream: &mut TcpStream, cfg: &Config) {
         }
         "/admin/models/sync" => {
             if let Ok(resp) = upstream::fetch_codex_models(cfg) {
+                if resp.status == 200 {
+                    merge_remote_models(cfg, &String::from_utf8_lossy(&resp.body));
+                }
+            }
+            if let Ok(resp) = upstream::fetch_claude_models(cfg) {
                 if resp.status == 200 {
                     merge_remote_models(cfg, &String::from_utf8_lossy(&resp.body));
                 }
@@ -273,6 +316,11 @@ fn merge_remote_models(cfg: &Config, text: &str) {
             id: id.to_string(),
             name: id.to_string(),
             upstream_id: id.to_string(),
+            provider_id: if id.starts_with("claude-") || id.starts_with("cc/claude-") {
+                "claude".to_string()
+            } else {
+                "codex".to_string()
+            },
             enabled: true,
         });
     }
@@ -288,6 +336,6 @@ pub fn logout(req: &Request, stream: &mut TcpStream, cfg: &Config) {
 
 fn style() -> &'static str {
     r#"
-*{box-sizing:border-box}body{margin:0;font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#101312;color:#f7f3eb}a{color:inherit;text-decoration:none}nav{position:absolute;top:0;left:0;right:0;z-index:3;display:flex;align-items:center;justify-content:space-between;padding:22px clamp(20px,5vw,64px)}nav div{display:flex;gap:18px;align-items:center}.brand{font-weight:760;letter-spacing:0}.hero{position:relative;min-height:92vh;overflow:hidden;display:flex;align-items:center}.hero-img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}.shade{position:absolute;inset:0;background:linear-gradient(90deg,rgba(12,14,14,.82) 0%,rgba(12,14,14,.64) 38%,rgba(12,14,14,.24) 70%,rgba(12,14,14,.72) 100%)}.copy{position:relative;z-index:2;width:min(720px,92vw);margin-left:clamp(22px,6vw,86px);padding-top:36px}.eyebrow{font-size:13px;text-transform:uppercase;letter-spacing:.12em;color:#6ee7c8;font-weight:800}.copy h1{font-size:clamp(56px,8vw,120px);line-height:.92;margin:12px 0 22px;letter-spacing:0}.lead{font-size:clamp(18px,2vw,24px);line-height:1.5;color:#ece4d5;max-width:680px}.actions{display:flex;gap:12px;flex-wrap:wrap;margin-top:30px}.button,button{display:inline-flex;align-items:center;justify-content:center;min-height:42px;border:1px solid #6ee7c8;background:#6ee7c8;color:#08110f;border-radius:7px;padding:0 16px;font-weight:760;cursor:pointer}.button.secondary,.button.ghost{background:rgba(255,255,255,.08);color:#f7f3eb;border-color:rgba(255,255,255,.22)}.band{background:#f7f3eb;color:#141817;padding:32px clamp(20px,5vw,64px) 64px}.grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:24px;max-width:1120px;margin:auto}.grid h2{font-size:20px;margin:0 0 8px}.grid p{margin:0;line-height:1.55;color:#3f4744}.admin-body{background:#f4f0e8;color:#151a18}.topbar{display:flex;justify-content:space-between;align-items:center;padding:16px 24px;background:#101312;color:#f7f3eb}.topbar nav{position:static;padding:0;gap:18px}.admin{padding:24px;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px}.panel{background:#fff;border:1px solid #d8d1c5;border-radius:8px;padding:20px;box-shadow:0 1px 2px rgba(0,0,0,.04)}.panel.wide{grid-column:1/-1}.panel h1{font-size:24px;margin:2px 0 0;color:#151a18;overflow-wrap:anywhere}.panel h2{font-size:18px;margin:0 0 14px}.muted,.steps{color:#56605c;line-height:1.5}.status-row,.row-head{display:flex;justify-content:space-between;gap:12px;align-items:center}.pill{display:inline-flex;border-radius:99px;padding:6px 10px;font-size:13px;font-weight:780}.pill.ok{background:#d8f7e7;color:#075d39}.pill.warn{background:#fff1c2;color:#755400}.stack{display:grid;gap:12px}.stack label{display:grid;gap:6px;font-weight:700}.stack input,.inline-form input{height:38px;border:1px solid #cfc7ba;border-radius:6px;padding:0 10px;font:inherit}.check{display:flex!important;grid-template-columns:auto 1fr;align-items:center}.check input{height:auto}.inline-form{display:grid;grid-template-columns:repeat(3,minmax(0,1fr)) auto;gap:8px;margin-top:14px}table{width:100%;border-collapse:collapse;font-size:14px}td,th{border-bottom:1px solid #e6dfd4;padding:10px;text-align:left}th{color:#56605c}.icon{min-height:30px;width:32px;padding:0;background:#fff;color:#8a1f11;border-color:#e8c6be}@media(max-width:820px){.grid,.admin{grid-template-columns:1fr}.copy h1{font-size:54px}.inline-form{grid-template-columns:1fr}.status-row,.row-head{display:grid}.topbar{display:grid;gap:10px}.hero{min-height:88vh}}
+*{box-sizing:border-box}body{margin:0;font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#101312;color:#f7f3eb}a{color:inherit;text-decoration:none}nav{position:absolute;top:0;left:0;right:0;z-index:3;display:flex;align-items:center;justify-content:space-between;padding:22px clamp(20px,5vw,64px)}nav div{display:flex;gap:18px;align-items:center}.brand{font-weight:760;letter-spacing:0}.hero{position:relative;min-height:92vh;overflow:hidden;display:flex;align-items:center}.hero-img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}.shade{position:absolute;inset:0;background:linear-gradient(90deg,rgba(12,14,14,.82) 0%,rgba(12,14,14,.64) 38%,rgba(12,14,14,.24) 70%,rgba(12,14,14,.72) 100%)}.copy{position:relative;z-index:2;width:min(720px,92vw);margin-left:clamp(22px,6vw,86px);padding-top:36px}.eyebrow{font-size:13px;text-transform:uppercase;letter-spacing:.12em;color:#6ee7c8;font-weight:800}.copy h1{font-size:clamp(56px,8vw,120px);line-height:.92;margin:12px 0 22px;letter-spacing:0}.lead{font-size:clamp(18px,2vw,24px);line-height:1.5;color:#ece4d5;max-width:680px}.actions{display:flex;gap:12px;flex-wrap:wrap;margin-top:30px}.button,button{display:inline-flex;align-items:center;justify-content:center;min-height:42px;border:1px solid #6ee7c8;background:#6ee7c8;color:#08110f;border-radius:7px;padding:0 16px;font-weight:760;cursor:pointer}.button.secondary,.button.ghost{background:rgba(255,255,255,.08);color:#f7f3eb;border-color:rgba(255,255,255,.22)}.band{background:#f7f3eb;color:#141817;padding:32px clamp(20px,5vw,64px) 64px}.grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:24px;max-width:1120px;margin:auto}.grid h2{font-size:20px;margin:0 0 8px}.grid p{margin:0;line-height:1.55;color:#3f4744}.admin-body{background:#f4f0e8;color:#151a18}.topbar{display:flex;justify-content:space-between;align-items:center;padding:16px 24px;background:#101312;color:#f7f3eb}.topbar nav{position:static;padding:0;gap:18px}.admin{padding:24px;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px}.panel{background:#fff;border:1px solid #d8d1c5;border-radius:8px;padding:20px;box-shadow:0 1px 2px rgba(0,0,0,.04)}.panel.wide{grid-column:1/-1}.panel h1{font-size:24px;margin:2px 0 0;color:#151a18;overflow-wrap:anywhere}.panel h2{font-size:18px;margin:0 0 14px}.muted,.steps{color:#56605c;line-height:1.5}.status-row,.row-head{display:flex;justify-content:space-between;gap:12px;align-items:center}.pill{display:inline-flex;border-radius:99px;padding:6px 10px;font-size:13px;font-weight:780}.pill.ok{background:#d8f7e7;color:#075d39}.pill.warn{background:#fff1c2;color:#755400}.provider-list{display:grid;gap:12px}.provider-form{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.3fr) auto auto auto;gap:10px;align-items:end;padding:12px;border:1px solid #e6dfd4;border-radius:8px;background:#fcfbf8}.provider-form strong{display:block;font-size:15px}.provider-main{display:grid;gap:4px;align-self:start}.stack{display:grid;gap:12px}.stack label,.provider-form label{display:grid;gap:6px;font-weight:700}.stack input,.inline-form input,.provider-form input{height:38px;border:1px solid #cfc7ba;border-radius:6px;padding:0 10px;font:inherit}.check{display:flex!important;grid-template-columns:auto 1fr;align-items:center}.check input{height:auto}.inline-form{display:grid;grid-template-columns:repeat(4,minmax(0,1fr)) auto;gap:8px;margin-top:14px}table{width:100%;border-collapse:collapse;font-size:14px}td,th{border-bottom:1px solid #e6dfd4;padding:10px;text-align:left}th{color:#56605c}.icon{min-height:30px;width:32px;padding:0;background:#fff;color:#8a1f11;border-color:#e8c6be}@media(max-width:820px){.grid,.admin,.provider-form{grid-template-columns:1fr}.copy h1{font-size:54px}.inline-form{grid-template-columns:1fr}.status-row,.row-head{display:grid}.topbar{display:grid;gap:10px}.hero{min-height:88vh}}
 "#
 }
