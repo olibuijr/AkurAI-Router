@@ -39,7 +39,7 @@ pub fn landing(req: &Request, stream: &mut TcpStream, cfg: &Config) {
     };
     let html = format!(
         r#"<!doctype html>
-<html lang="en">
+<html lang="en" data-theme="">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -48,7 +48,8 @@ pub fn landing(req: &Request, stream: &mut TcpStream, cfg: &Config) {
   <meta property="og:description" content="A minimal Rust OpenAI-compatible router with provider-prefixed model routing.">
   <meta property="og:image" content="{base}/assets/hero.png">
   <title>AkurAI Router</title>
-  <style>{css}</style>
+  <script>{flash_js}</script>
+  <style>{themes}{css}</style>
 </head>
 <body>
   <main class="hero">
@@ -60,6 +61,7 @@ pub fn landing(req: &Request, stream: &mut TcpStream, cfg: &Config) {
         <a href="/v1/models">Models</a>
         <a href="https://github.com/olibuijr/AkurAI-Router">GitHub</a>
         {admin_link}
+        <span data-theme-picker></span>
       </div>
     </nav>
     <section class="copy">
@@ -79,10 +81,14 @@ pub fn landing(req: &Request, stream: &mut TcpStream, cfg: &Config) {
       <div><h2>Provider native</h2><p>Model IDs use `codex/`, `claude/`, and `opencode-go/` prefixes while upstream auth stays server-side.</p></div>
     </div>
   </section>
+  <script>{picker_js}</script>
 </body>
 </html>"#,
         base = cfg.public_base_url,
+        flash_js = flash_guard_js(),
+        themes = themes_css(),
         css = style(),
+        picker_js = theme_picker_js(),
         admin_link = admin_link,
     );
     let _ = http::send_text(stream, 200, "text/html; charset=utf-8", &html);
@@ -208,10 +214,10 @@ pub fn admin(req: &Request, stream: &mut TcpStream, cfg: &Config) {
         .join("");
     let html = format!(
         r#"<!doctype html>
-<html lang="en">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>AkurAI Router Admin</title><style>{css}</style></head>
+<html lang="en" data-theme="">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>AkurAI Router Admin</title><script>{flash_js}</script><style>{themes}{css}</style></head>
 <body class="admin-body">
-<header class="topbar"><a class="brand" href="/">AkurAI Router</a><nav><span>{email}</span><a href="/logout">Log out</a></nav></header>
+<header class="topbar"><a class="brand" href="/">AkurAI Router</a><nav><span>{email}</span><a href="/logout">Log out</a><span data-theme-picker></span></nav></header>
 <main class="admin">
   <section class="panel wide">
     <div><p class="eyebrow">Endpoint</p><h1>{base}/v1</h1></div>
@@ -273,9 +279,13 @@ pub fn admin(req: &Request, stream: &mut TcpStream, cfg: &Config) {
     </form>
   </section>
 </main>
+<script>{picker_js}</script>
 </body>
 </html>"#,
+        flash_js = flash_guard_js(),
+        themes = themes_css(),
         css = style(),
+        picker_js = theme_picker_js(),
         email = html_escape(&session.email),
         expires = session.expires_at,
         base = html_escape(&cfg.public_base_url),
@@ -459,10 +469,10 @@ fn generated_key_page(
 ) {
     let html = format!(
         r#"<!doctype html>
-<html lang="en">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>AkurAI Router Key</title><style>{css}</style></head>
+<html lang="en" data-theme="">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>AkurAI Router Key</title><script>{flash_js}</script><style>{themes}{css}</style></head>
 <body class="admin-body">
-<header class="topbar"><a class="brand" href="/">AkurAI Router</a><nav><span>{email}</span><a href="/admin">Admin</a></nav></header>
+<header class="topbar"><a class="brand" href="/">AkurAI Router</a><nav><span>{email}</span><a href="/admin">Admin</a><span data-theme-picker></span></nav></header>
 <main class="admin">
   <section class="panel wide">
     <p class="eyebrow">Router key created</p>
@@ -472,9 +482,13 @@ fn generated_key_page(
     <a class="button" href="/admin">Return to admin</a>
   </section>
 </main>
+<script>{picker_js}</script>
 </body>
 </html>"#,
+        flash_js = flash_guard_js(),
+        themes = themes_css(),
         css = style(),
+        picker_js = theme_picker_js(),
         email = html_escape(email),
         key_id = html_escape(key_id),
         key = html_escape(plaintext),
@@ -556,8 +570,61 @@ pub fn logout(req: &Request, stream: &mut TcpStream, cfg: &Config) {
     let _ = http::redirect(stream, "/", &[auth::clear_session_cookie(cfg)]);
 }
 
+// ── Theme CSS ─────────────────────────────────────────────────────────────────
+// All 17 AkurAI-Framework base16 theme token blocks. Generated from the same
+// scheme YAML files used by akurai-css::theme, following the identical
+// slot→token mapping (base00→--bg … base0E→--accent-2). The first (akurai)
+// is also emitted as the bare :root default so pages with no data-theme set
+// render correctly. --radius is a layout constant set once in :root; it does
+// not change per-theme. --shadow tracks polarity (dark/light).
+fn themes_css() -> &'static str {
+    r#":root{--bg:#060912;--bg-2:#0b1224;--panel:#0e162b;--panel-2:#1b2742;--border:#1b2742;--border-2:#9fb0d4;--fg:#eef3ff;--muted:#9fb0d4;--dim:#1b2742;--accent:#5b8cff;--accent-2:#7af0d0;--ok:#7af0d0;--warn:#ffcf8b;--info:#6bb8ff;--danger:#ff6b81;--radius:8px;--shadow:0 24px 60px -28px rgba(0,0,0,.55);color-scheme:dark}
+:root[data-theme="akurai"]{--bg:#060912;--bg-2:#0b1224;--panel:#0e162b;--panel-2:#1b2742;--border:#1b2742;--border-2:#9fb0d4;--fg:#eef3ff;--muted:#9fb0d4;--dim:#1b2742;--accent:#5b8cff;--accent-2:#7af0d0;--ok:#7af0d0;--warn:#ffcf8b;--info:#6bb8ff;--danger:#ff6b81;--shadow:0 24px 60px -28px rgba(0,0,0,.55);color-scheme:dark}
+:root[data-theme="akurai-light"]{--bg:#f7f8fb;--bg-2:#eef1f6;--panel:#e2e7f0;--panel-2:#cdd5e2;--border:#cdd5e2;--border-2:#5b657d;--fg:#1d2430;--muted:#5b657d;--dim:#cdd5e2;--accent:#2e56b8;--accent-2:#6d4bd8;--ok:#1f9d57;--warn:#b7791f;--info:#2570d4;--danger:#d92d20;--shadow:0 18px 45px -24px rgba(20,22,30,.16);color-scheme:light}
+:root[data-theme="claude-code"]{--bg:#1f1e1b;--bg-2:#262320;--panel:#2f2b27;--panel-2:#3a352f;--border:#3a352f;--border-2:#8a8279;--fg:#e6e0d6;--muted:#8a8279;--dim:#3a352f;--accent:#cc785c;--accent-2:#a87b9e;--ok:#8a9a5b;--warn:#d9a05b;--info:#5b9aa0;--danger:#bf4d43;--shadow:0 24px 60px -28px rgba(0,0,0,.55);color-scheme:dark}
+:root[data-theme="claude-code-light"]{--bg:#f5f1e8;--bg-2:#ece7da;--panel:#e0dac9;--panel-2:#cfc8b5;--border:#cfc8b5;--border-2:#6b6457;--fg:#3d3a34;--muted:#6b6457;--dim:#cfc8b5;--accent:#c15f3c;--accent-2:#8a5a7e;--ok:#5f7a3a;--warn:#b07a2e;--info:#3f7a80;--danger:#bf4d43;--shadow:0 18px 45px -24px rgba(20,22,30,.16);color-scheme:light}
+:root[data-theme="nord"]{--bg:#2e3440;--bg-2:#3b4252;--panel:#434c5e;--panel-2:#4c566a;--border:#4c566a;--border-2:#d8dee9;--fg:#e5e9f0;--muted:#d8dee9;--dim:#4c566a;--accent:#81a1c1;--accent-2:#b48ead;--ok:#a3be8c;--warn:#ebcb8b;--info:#88c0d0;--danger:#bf616a;--shadow:0 24px 60px -28px rgba(0,0,0,.55);color-scheme:dark}
+:root[data-theme="nord-light"]{--bg:#eceff4;--bg-2:#e5e9f0;--panel:#d8dee9;--panel-2:#aebacf;--border:#aebacf;--border-2:#4c566a;--fg:#2e3440;--muted:#4c566a;--dim:#aebacf;--accent:#5e81ac;--accent-2:#8a5a7e;--ok:#6e8b4f;--warn:#a9863a;--info:#2d7d8a;--danger:#b1444e;--shadow:0 18px 45px -24px rgba(20,22,30,.16);color-scheme:light}
+:root[data-theme="catppuccin-mocha"]{--bg:#1e1e2e;--bg-2:#181825;--panel:#313244;--panel-2:#45475a;--border:#45475a;--border-2:#585b70;--fg:#cdd6f4;--muted:#585b70;--dim:#45475a;--accent:#89b4fa;--accent-2:#cba6f7;--ok:#a6e3a1;--warn:#f9e2af;--info:#94e2d5;--danger:#f38ba8;--shadow:0 24px 60px -28px rgba(0,0,0,.55);color-scheme:dark}
+:root[data-theme="catppuccin-latte"]{--bg:#eff1f5;--bg-2:#e6e9ef;--panel:#ccd0da;--panel-2:#bcc0cc;--border:#bcc0cc;--border-2:#acb0be;--fg:#4c4f69;--muted:#acb0be;--dim:#bcc0cc;--accent:#1e66f5;--accent-2:#8839ef;--ok:#40a02b;--warn:#df8e1d;--info:#179299;--danger:#d20f39;--shadow:0 18px 45px -24px rgba(20,22,30,.16);color-scheme:light}
+:root[data-theme="solarized-dark"]{--bg:#002b36;--bg-2:#073642;--panel:#586e75;--panel-2:#657b83;--border:#657b83;--border-2:#839496;--fg:#93a1a1;--muted:#839496;--dim:#657b83;--accent:#268bd2;--accent-2:#6c71c4;--ok:#859900;--warn:#b58900;--info:#2aa198;--danger:#dc322f;--shadow:0 24px 60px -28px rgba(0,0,0,.55);color-scheme:dark}
+:root[data-theme="solarized-light"]{--bg:#fdf6e3;--bg-2:#eee8d5;--panel:#93a1a1;--panel-2:#839496;--border:#839496;--border-2:#657b83;--fg:#586e75;--muted:#657b83;--dim:#839496;--accent:#268bd2;--accent-2:#6c71c4;--ok:#859900;--warn:#b58900;--info:#2aa198;--danger:#dc322f;--shadow:0 18px 45px -24px rgba(20,22,30,.16);color-scheme:light}
+:root[data-theme="gruvbox-dark"]{--bg:#282828;--bg-2:#3c3836;--panel:#504945;--panel-2:#665c54;--border:#665c54;--border-2:#bdae93;--fg:#d5c4a1;--muted:#bdae93;--dim:#665c54;--accent:#83a598;--accent-2:#d3869b;--ok:#b8bb26;--warn:#fabd2f;--info:#8ec07c;--danger:#fb4934;--shadow:0 24px 60px -28px rgba(0,0,0,.55);color-scheme:dark}
+:root[data-theme="gruvbox-light"]{--bg:#fbf1c7;--bg-2:#ebdbb2;--panel:#d5c4a1;--panel-2:#bdae93;--border:#bdae93;--border-2:#665c54;--fg:#504945;--muted:#665c54;--dim:#bdae93;--accent:#076678;--accent-2:#8f3f71;--ok:#79740e;--warn:#b57614;--info:#427b58;--danger:#9d0006;--shadow:0 18px 45px -24px rgba(20,22,30,.16);color-scheme:light}
+:root[data-theme="tokyo-night"]{--bg:#1a1b26;--bg-2:#16161e;--panel:#2f3549;--panel-2:#444b6a;--border:#444b6a;--border-2:#787c99;--fg:#a9b1d6;--muted:#787c99;--dim:#444b6a;--accent:#2ac3de;--accent-2:#bb9af7;--ok:#9ece6a;--warn:#0db9d7;--info:#b4f9f8;--danger:#c0caf5;--shadow:0 24px 60px -28px rgba(0,0,0,.55);color-scheme:dark}
+:root[data-theme="tokyo-night-light"]{--bg:#d5d6db;--bg-2:#cbccd1;--panel:#dfe0e5;--panel-2:#9699a3;--border:#9699a3;--border-2:#4c505e;--fg:#343b59;--muted:#4c505e;--dim:#9699a3;--accent:#34548a;--accent-2:#5a4a78;--ok:#485e30;--warn:#166775;--info:#3e6968;--danger:#343b58;--shadow:0 18px 45px -24px rgba(20,22,30,.16);color-scheme:light}
+:root[data-theme="rose-pine"]{--bg:#191724;--bg-2:#1f1d2e;--panel:#26233a;--panel-2:#6e6a86;--border:#6e6a86;--border-2:#908caa;--fg:#e0def4;--muted:#908caa;--dim:#6e6a86;--accent:#c4a7e7;--accent-2:#f6c177;--ok:#31748f;--warn:#ebbcba;--info:#9ccfd8;--danger:#eb6f92;--shadow:0 24px 60px -28px rgba(0,0,0,.55);color-scheme:dark}
+:root[data-theme="rose-pine-dawn"]{--bg:#faf4ed;--bg-2:#fffaf3;--panel:#f2e9de;--panel-2:#9893a5;--border:#9893a5;--border-2:#797593;--fg:#575279;--muted:#797593;--dim:#9893a5;--accent:#907aa9;--accent-2:#ea9d34;--ok:#286983;--warn:#d7827e;--info:#56949f;--danger:#b4637a;--shadow:0 18px 45px -24px rgba(20,22,30,.16);color-scheme:light}
+:root[data-theme="dracula"]{--bg:#282a36;--bg-2:#21222c;--panel:#44475a;--panel-2:#6272a4;--border:#6272a4;--border-2:#9ea8c7;--fg:#f8f8f2;--muted:#9ea8c7;--dim:#6272a4;--accent:#bd93f9;--accent-2:#ff79c6;--ok:#50fa7b;--warn:#f1fa8c;--info:#8be9fd;--danger:#ff5555;--shadow:0 24px 60px -28px rgba(0,0,0,.55);color-scheme:dark}
+"#
+}
+
+// ── Flash guard ────────────────────────────────────────────────────────────────
+// Runs synchronously in <head> before first paint. Reads the suite-wide
+// akurai-theme cookie (written by any *.olibuijr.com app), falls back to
+// localStorage, then OS colour-scheme preference. Sets data-theme on <html>
+// so the correct :root[data-theme] token block applies immediately — no FOUC.
+fn flash_guard_js() -> &'static str {
+    r#"(function(){var m=document.cookie.match(/(?:^|; )akurai-theme=([^;]*)/);var t=m?decodeURIComponent(m[1]):null;if(!t){try{t=localStorage.getItem('akurai-theme');}catch(e){}}if(!t)t=(window.matchMedia&&window.matchMedia('(prefers-color-scheme:light)').matches)?'akurai-light':'akurai';document.documentElement.setAttribute('data-theme',t);})();"#
+}
+
+// ── Theme picker + suite sync ──────────────────────────────────────────────────
+// Mounts a <select> into any [data-theme-picker] slot. Persists choice to the
+// .olibuijr.com cookie so all suite apps (akurai-drive, framework, router …)
+// share the same active theme. Syncs open tabs via BroadcastChannel and
+// re-adopts the cookie on focus/visibilitychange for cross-subdomain live sync.
+fn theme_picker_js() -> &'static str {
+    r#"(function(){var KEY='akurai-theme';var THEMES=[['akurai','AkurAI'],['akurai-light','AkurAI Light'],['claude-code','Claude Code'],['claude-code-light','Claude Code Light'],['nord','Nord'],['nord-light','Nord Light'],['catppuccin-mocha','Catppuccin Mocha'],['catppuccin-latte','Catppuccin Latte'],['solarized-dark','Solarized Dark'],['solarized-light','Solarized Light'],['gruvbox-dark','Gruvbox Dark'],['gruvbox-light','Gruvbox Light'],['tokyo-night','Tokyo Night'],['tokyo-night-light','Tokyo Night Light'],['rose-pine','Rose Pine'],['rose-pine-dawn','Rose Pine Dawn'],['dracula','Dracula']];function pDom(){var h=location.hostname;if(!h||h==='localhost'||/^[0-9.]+$/.test(h))return '';var p=h.split('.');return p.length<2?'':'.'+p.slice(-2).join('.');}function readCookie(){var m=document.cookie.match(/(?:^|; )akurai-theme=([^;]*)/);return m?decodeURIComponent(m[1]):null;}function writeCookie(s){var dom=pDom(),sec=location.protocol==='https:'?';secure':'';document.cookie=KEY+'='+encodeURIComponent(s)+';path=/;max-age=31536000;samesite=lax'+(dom?';domain='+dom:'')+sec;}function reflect(s){if(!s)return;document.documentElement.setAttribute('data-theme',s);try{localStorage.setItem(KEY,s);}catch(e){}if(sel)sel.value=s;}function apply(s){reflect(s);writeCookie(s);try{ch&&ch.postMessage(s);}catch(e){}}function current(){return readCookie()||(function(){try{return localStorage.getItem(KEY);}catch(e){return null;}})()||(window.matchMedia&&window.matchMedia('(prefers-color-scheme:light)').matches?'akurai-light':'akurai');}var sel=null;var ch=null;try{ch='BroadcastChannel' in window?new BroadcastChannel('akurai-theme'):null;}catch(e){}if(ch)ch.onmessage=function(e){reflect(e.data);};var adoptCookie=function(){var c=readCookie();if(c)reflect(c);};window.addEventListener('focus',adoptCookie);document.addEventListener('visibilitychange',function(){if(document.visibilityState==='visible')adoptCookie();});var slot=document.querySelector('[data-theme-picker]');if(slot){sel=document.createElement('select');sel.className='theme-select';sel.setAttribute('aria-label','Color theme');THEMES.forEach(function(t){var o=document.createElement('option');o.value=t[0];o.textContent=t[1];sel.appendChild(o);});var c=current();sel.value=c;reflect(c);sel.addEventListener('change',function(){apply(sel.value);});slot.appendChild(sel);}else{reflect(current());}})();"#
+}
+
+// ── Component CSS ──────────────────────────────────────────────────────────────
+// All layout, typography, and component rules expressed through the semantic
+// tokens emitted by themes_css(). No hardcoded colour values — every colour
+// reference is a var(--token). The admin page now inherits the same dark/light
+// theming as the landing page; the previous hardcoded light-cream admin
+// background (#f4f0e8) and white panels (#fff) are replaced by var(--bg) /
+// var(--panel) so the admin matches whatever theme is active suite-wide.
 fn style() -> &'static str {
-    r#"
-*{box-sizing:border-box}body{margin:0;font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#101312;color:#f7f3eb}a{color:inherit;text-decoration:none}nav{position:absolute;top:0;left:0;right:0;z-index:3;display:flex;align-items:center;justify-content:space-between;padding:22px clamp(20px,5vw,64px)}nav div{display:flex;gap:18px;align-items:center}.brand{font-weight:760;letter-spacing:0}.hero{position:relative;min-height:92vh;overflow:hidden;display:flex;align-items:center}.hero-img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}.shade{position:absolute;inset:0;background:linear-gradient(90deg,rgba(12,14,14,.82) 0%,rgba(12,14,14,.64) 38%,rgba(12,14,14,.24) 70%,rgba(12,14,14,.72) 100%)}.copy{position:relative;z-index:2;width:min(720px,92vw);margin-left:clamp(22px,6vw,86px);padding-top:36px}.eyebrow{font-size:13px;text-transform:uppercase;letter-spacing:.12em;color:#6ee7c8;font-weight:800}.copy h1{font-size:clamp(56px,8vw,120px);line-height:.92;margin:12px 0 22px;letter-spacing:0}.lead{font-size:clamp(18px,2vw,24px);line-height:1.5;color:#ece4d5;max-width:680px}.actions{display:flex;gap:12px;flex-wrap:wrap;margin-top:30px}.button,button{display:inline-flex;align-items:center;justify-content:center;min-height:42px;border:1px solid #6ee7c8;background:#6ee7c8;color:#08110f;border-radius:7px;padding:0 16px;font-weight:760;cursor:pointer}.button.secondary,.button.ghost{background:rgba(255,255,255,.08);color:#f7f3eb;border-color:rgba(255,255,255,.22)}.band{background:#f7f3eb;color:#141817;padding:32px clamp(20px,5vw,64px) 64px}.grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:24px;max-width:1120px;margin:auto}.grid h2{font-size:20px;margin:0 0 8px}.grid p{margin:0;line-height:1.55;color:#3f4744}.admin-body{background:#f4f0e8;color:#151a18}.topbar{display:flex;justify-content:space-between;align-items:center;padding:16px 24px;background:#101312;color:#f7f3eb}.topbar nav{position:static;padding:0;gap:18px}.admin{padding:24px;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px}.panel{background:#fff;border:1px solid #d8d1c5;border-radius:8px;padding:20px;box-shadow:0 1px 2px rgba(0,0,0,.04)}.panel.wide{grid-column:1/-1}.panel h1{font-size:24px;margin:2px 0 0;color:#151a18;overflow-wrap:anywhere}.panel h2{font-size:18px;margin:0 0 14px}.muted,.steps{color:#56605c;line-height:1.5}.status-row,.row-head{display:flex;justify-content:space-between;gap:12px;align-items:center}.metric-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin-top:16px}.metric{border:1px solid #e6dfd4;border-radius:8px;padding:12px;background:#fcfbf8}.metric span{display:block;color:#56605c;font-size:13px}.metric strong{display:block;font-size:22px;margin-top:4px}.pill{display:inline-flex;border-radius:99px;padding:6px 10px;font-size:13px;font-weight:780}.pill.ok{background:#d8f7e7;color:#075d39}.pill.warn{background:#fff1c2;color:#755400}.provider-list{display:grid;gap:12px}.provider-form{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.3fr) auto auto auto;gap:10px;align-items:end;padding:12px;border:1px solid #e6dfd4;border-radius:8px;background:#fcfbf8}.provider-form strong{display:block;font-size:15px}.provider-main{display:grid;gap:4px;align-self:start}.stack{display:grid;gap:12px}.stack label,.provider-form label{display:grid;gap:6px;font-weight:700}.stack input,.inline-form input,.provider-form input,.mini-form input,.inline-form select{height:38px;border:1px solid #cfc7ba;border-radius:6px;padding:0 10px;font:inherit;background:#fff}.check{display:flex!important;grid-template-columns:auto 1fr;align-items:center}.check input{height:auto}.inline-form{display:grid;grid-template-columns:repeat(4,minmax(0,1fr)) auto;gap:8px;margin-top:14px}.key-add{grid-template-columns:minmax(0,1fr) minmax(0,1fr) auto}.user-add{grid-template-columns:minmax(0,1.2fr) minmax(0,1fr) minmax(120px,.5fr) auto auto}.mini-form{display:flex;gap:8px;align-items:end}.mini-form label{display:grid;gap:5px;font-size:13px;font-weight:700}.key-box{white-space:pre-wrap;overflow-wrap:anywhere;background:#101312;color:#6ee7c8;border-radius:8px;padding:14px;font-size:15px}table{width:100%;border-collapse:collapse;font-size:14px}td,th{border-bottom:1px solid #e6dfd4;padding:10px;text-align:left}th{color:#56605c}.icon{min-height:30px;width:32px;padding:0;background:#fff;color:#8a1f11;border-color:#e8c6be}@media(max-width:820px){.grid,.admin,.provider-form,.metric-grid{grid-template-columns:1fr}.copy h1{font-size:54px}.inline-form,.key-add,.user-add{grid-template-columns:1fr}.status-row,.row-head,.mini-form{display:grid}.topbar{display:grid;gap:10px}.hero{min-height:88vh}}
+    r#"*{box-sizing:border-box}body{margin:0;font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:var(--bg);color:var(--fg)}a{color:inherit;text-decoration:none}nav{position:absolute;top:0;left:0;right:0;z-index:3;display:flex;align-items:center;justify-content:space-between;padding:22px clamp(20px,5vw,64px)}nav div{display:flex;gap:18px;align-items:center}.brand{font-weight:760;letter-spacing:0}.hero{position:relative;min-height:92vh;overflow:hidden;display:flex;align-items:center}.hero-img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}.shade{position:absolute;inset:0;background:linear-gradient(90deg,rgba(0,0,0,.82) 0%,rgba(0,0,0,.56) 38%,rgba(0,0,0,.18) 70%,rgba(0,0,0,.64) 100%)}.copy{position:relative;z-index:2;width:min(720px,92vw);margin-left:clamp(22px,6vw,86px);padding-top:36px}.eyebrow{font-size:13px;text-transform:uppercase;letter-spacing:.12em;color:var(--accent-2);font-weight:800}.copy h1{font-size:clamp(56px,8vw,120px);line-height:.92;margin:12px 0 22px;letter-spacing:0}.lead{font-size:clamp(18px,2vw,24px);line-height:1.5;color:var(--fg);opacity:.85;max-width:680px}.actions{display:flex;gap:12px;flex-wrap:wrap;margin-top:30px}.button,button{display:inline-flex;align-items:center;justify-content:center;min-height:42px;border:1px solid var(--accent);background:var(--accent);color:var(--bg);border-radius:var(--radius);padding:0 16px;font-weight:760;cursor:pointer;font:inherit}.button.secondary,.button.ghost{background:var(--panel);color:var(--fg);border-color:var(--border)}.band{background:var(--bg-2);color:var(--fg);padding:32px clamp(20px,5vw,64px) 64px}.grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:24px;max-width:1120px;margin:auto}.grid h2{font-size:20px;margin:0 0 8px}.grid p{margin:0;line-height:1.55;color:var(--muted)}.admin-body{background:var(--bg);color:var(--fg)}.topbar{display:flex;justify-content:space-between;align-items:center;padding:16px 24px;background:var(--bg-2);color:var(--fg);border-bottom:1px solid var(--border)}.topbar nav{position:static;padding:0;gap:16px}.topbar a{color:var(--muted)}.topbar a:hover{color:var(--fg)}.admin{padding:24px;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px}.panel{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);padding:20px;box-shadow:var(--shadow)}.panel.wide{grid-column:1/-1}.panel h1{font-size:24px;margin:2px 0 0;color:var(--fg);overflow-wrap:anywhere}.panel h2{font-size:18px;margin:0 0 14px}.muted,.steps{color:var(--muted);line-height:1.5}.status-row,.row-head{display:flex;justify-content:space-between;gap:12px;align-items:center}.metric-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin-top:16px}.metric{border:1px solid var(--border);border-radius:var(--radius);padding:12px;background:var(--bg-2)}.metric span{display:block;color:var(--muted);font-size:13px}.metric strong{display:block;font-size:22px;margin-top:4px}.pill{display:inline-flex;border-radius:99px;padding:6px 10px;font-size:13px;font-weight:780}.pill.ok{background:color-mix(in srgb,var(--ok) 18%,var(--panel));color:var(--ok)}.pill.warn{background:color-mix(in srgb,var(--warn) 18%,var(--panel));color:var(--warn)}.provider-list{display:grid;gap:12px}.provider-form{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.3fr) auto auto auto;gap:10px;align-items:end;padding:12px;border:1px solid var(--border);border-radius:var(--radius);background:var(--bg-2)}.provider-form strong{display:block;font-size:15px}.provider-main{display:grid;gap:4px;align-self:start}.stack{display:grid;gap:12px}.stack label,.provider-form label{display:grid;gap:6px;font-weight:700}.stack input,.inline-form input,.provider-form input,.mini-form input,.inline-form select{height:38px;border:1px solid var(--border);border-radius:6px;padding:0 10px;font:inherit;background:var(--bg);color:var(--fg)}.check{display:flex!important;grid-template-columns:auto 1fr;align-items:center}.check input{height:auto}.inline-form{display:grid;grid-template-columns:repeat(4,minmax(0,1fr)) auto;gap:8px;margin-top:14px}.key-add{grid-template-columns:minmax(0,1fr) minmax(0,1fr) auto}.user-add{grid-template-columns:minmax(0,1.2fr) minmax(0,1fr) minmax(120px,.5fr) auto auto}.mini-form{display:flex;gap:8px;align-items:end}.mini-form label{display:grid;gap:5px;font-size:13px;font-weight:700}.key-box{white-space:pre-wrap;overflow-wrap:anywhere;background:var(--bg);color:var(--accent-2);border:1px solid var(--border);border-radius:var(--radius);padding:14px;font-size:15px}table{width:100%;border-collapse:collapse;font-size:14px}td,th{border-bottom:1px solid var(--border);padding:10px;text-align:left}th{color:var(--muted)}.icon{min-height:30px;width:32px;padding:0;background:var(--panel);color:var(--danger);border-color:color-mix(in srgb,var(--danger) 30%,var(--border))}.theme-select{height:32px;padding:0 8px;border-radius:6px;border:1px solid var(--border);background:var(--panel);color:var(--fg);font:inherit;font-size:13px;cursor:pointer}@media(max-width:820px){.grid,.admin,.provider-form,.metric-grid{grid-template-columns:1fr}.copy h1{font-size:54px}.inline-form,.key-add,.user-add{grid-template-columns:1fr}.status-row,.row-head,.mini-form{display:grid}.topbar{display:grid;gap:10px}.hero{min-height:88vh}}
 "#
 }
