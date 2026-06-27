@@ -7,6 +7,9 @@ use crate::util::{env_quote, random_hex};
 pub const PROVIDER_CODEX: &str = "codex";
 pub const PROVIDER_CLAUDE: &str = "claude";
 pub const PROVIDER_OPENCODE_GO: &str = "opencode-go";
+pub const PROVIDER_EMBEDDINGS: &str = "embeddings";
+pub const DEFAULT_EMBEDDING_MODEL: &str = "intfloat/multilingual-e5-small";
+pub const DEFAULT_EMBEDDING_UPSTREAM_URL: &str = "http://127.0.0.1:8081/v1/embeddings";
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -47,6 +50,13 @@ pub struct Provider {
     pub name: String,
     pub enabled: bool,
     pub auth_path: PathBuf,
+}
+
+#[derive(Clone, Debug)]
+pub struct EmbeddingConfig {
+    pub enabled: bool,
+    pub upstream_url: String,
+    pub model: String,
 }
 
 impl Config {
@@ -179,6 +189,10 @@ pub fn ensure_default_files(cfg: &Config) -> Result<(), String> {
     if !models_path.exists() || models_changed {
         save_models(cfg, &models)?;
     }
+    let embeddings_path = cfg.data_dir.join("embeddings.conf");
+    if !embeddings_path.exists() {
+        save_embedding_config(cfg, &load_embedding_config(cfg))?;
+    }
     Ok(())
 }
 
@@ -257,6 +271,12 @@ pub fn default_models() -> Vec<Model> {
             "Claude Opus 4.1",
             "claude-opus-4-1-20250805",
             PROVIDER_CLAUDE,
+        ),
+        (
+            "multilingual-e5-small",
+            "Multilingual E5 Small",
+            DEFAULT_EMBEDDING_MODEL,
+            PROVIDER_EMBEDDINGS,
         ),
     ]
     .into_iter()
@@ -401,6 +421,35 @@ pub fn save_providers(cfg: &Config, providers: &[Provider]) -> Result<(), String
     fs::write(cfg.data_dir.join("providers.conf"), out).map_err(|e| e.to_string())
 }
 
+pub fn load_embedding_config(cfg: &Config) -> EmbeddingConfig {
+    let conf = read_kv(&cfg.data_dir.join("embeddings.conf"));
+    let get = |key: &str, default: &str| -> String {
+        conf.iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.clone())
+            .or_else(|| env::var(key).ok())
+            .unwrap_or_else(|| default.to_string())
+    };
+    EmbeddingConfig {
+        enabled: config_bool(&get("AKURAI_ROUTER_EMBEDDINGS_ENABLED", "true"), true),
+        upstream_url: get(
+            "AKURAI_ROUTER_EMBEDDINGS_URL",
+            DEFAULT_EMBEDDING_UPSTREAM_URL,
+        ),
+        model: get("AKURAI_ROUTER_EMBEDDINGS_MODEL", DEFAULT_EMBEDDING_MODEL),
+    }
+}
+
+pub fn save_embedding_config(cfg: &Config, embedding: &EmbeddingConfig) -> Result<(), String> {
+    let content = format!(
+        "AKURAI_ROUTER_EMBEDDINGS_ENABLED={}\nAKURAI_ROUTER_EMBEDDINGS_URL={}\nAKURAI_ROUTER_EMBEDDINGS_MODEL={}\n",
+        if embedding.enabled { "true" } else { "false" },
+        env_quote(&embedding.upstream_url),
+        env_quote(&embedding.model),
+    );
+    fs::write(cfg.data_dir.join("embeddings.conf"), content).map_err(|e| e.to_string())
+}
+
 pub fn write_local_env_template(cfg: &Config) -> Result<PathBuf, String> {
     fs::create_dir_all(&cfg.data_dir).map_err(|e| e.to_string())?;
     let path = cfg.data_dir.join("router.conf");
@@ -415,7 +464,7 @@ pub fn write_local_env_template(cfg: &Config) -> Result<PathBuf, String> {
         cfg.cookie_secret.clone()
     };
     let content = format!(
-        "AKURAI_ROUTER_LISTEN={}\nAKURAI_ROUTER_PUBLIC_URL={}\nAKURAI_ROUTER_API_KEY={}\nAKURAI_ROUTER_COOKIE_SECRET={}\nAKURAI_ROUTER_CODEX_AUTH_PATH={}\nAKURAI_ROUTER_CLAUDE_AUTH_PATH={}\nAKURAI_ROUTER_OPENCODE_GO_AUTH_PATH={}\nAKURAI_ROUTER_DEFAULT_MODEL={}\nAKURAI_ROUTER_IDP_ISSUER={}\nAKURAI_ROUTER_IDP_CLIENT_ID={}\nAKURAI_ROUTER_IDP_CLIENT_SECRET={}\nAKURAI_ROUTER_ADMIN_EMAIL={}\n",
+        "AKURAI_ROUTER_LISTEN={}\nAKURAI_ROUTER_PUBLIC_URL={}\nAKURAI_ROUTER_API_KEY={}\nAKURAI_ROUTER_COOKIE_SECRET={}\nAKURAI_ROUTER_CODEX_AUTH_PATH={}\nAKURAI_ROUTER_CLAUDE_AUTH_PATH={}\nAKURAI_ROUTER_OPENCODE_GO_AUTH_PATH={}\nAKURAI_ROUTER_DEFAULT_MODEL={}\nAKURAI_ROUTER_EMBEDDINGS_URL={}\nAKURAI_ROUTER_EMBEDDINGS_MODEL={}\nAKURAI_ROUTER_EMBEDDINGS_ENABLED=true\nAKURAI_ROUTER_IDP_ISSUER={}\nAKURAI_ROUTER_IDP_CLIENT_ID={}\nAKURAI_ROUTER_IDP_CLIENT_SECRET={}\nAKURAI_ROUTER_ADMIN_EMAIL={}\n",
         env_quote(&cfg.listen_addr),
         env_quote(&cfg.public_base_url),
         env_quote(&api_key),
@@ -424,6 +473,8 @@ pub fn write_local_env_template(cfg: &Config) -> Result<PathBuf, String> {
         env_quote(&cfg.claude_auth_path.display().to_string()),
         env_quote(&cfg.opencode_go_auth_path.display().to_string()),
         env_quote(&cfg.default_model),
+        env_quote(DEFAULT_EMBEDDING_UPSTREAM_URL),
+        env_quote(DEFAULT_EMBEDDING_MODEL),
         env_quote(&cfg.idp_issuer),
         env_quote(&cfg.idp_client_id),
         env_quote(&cfg.idp_client_secret),
@@ -434,10 +485,15 @@ pub fn write_local_env_template(cfg: &Config) -> Result<PathBuf, String> {
 }
 
 pub fn infer_model_provider_id(model_id: &str) -> String {
+    if model_id == DEFAULT_EMBEDDING_MODEL
+        || model_id.starts_with("multilingual-e5")
+        || model_id.starts_with("intfloat/")
+    {
+        return PROVIDER_EMBEDDINGS.to_string();
+    }
     if let Some((provider_id, _)) = split_model_provider_prefix(model_id) {
         return provider_id;
-    }
-    if model_id.starts_with("claude-") {
+    } else if model_id.starts_with("claude-") {
         PROVIDER_CLAUDE.to_string()
     } else if is_opencode_go_model(model_id) {
         PROVIDER_OPENCODE_GO.to_string()
@@ -458,6 +514,7 @@ pub fn provider_display_name(provider_id: &str) -> &'static str {
     match canonical_provider_id(provider_id).as_str() {
         PROVIDER_CLAUDE => "Claude Code",
         PROVIDER_OPENCODE_GO => "OpenCode Go",
+        PROVIDER_EMBEDDINGS => "Embeddings",
         _ => "OpenAI Codex",
     }
 }
@@ -467,6 +524,7 @@ pub fn canonical_provider_id(provider_id: &str) -> String {
         "cx" => PROVIDER_CODEX.to_string(),
         "cc" => PROVIDER_CLAUDE.to_string(),
         "opencode" | "ocg" => PROVIDER_OPENCODE_GO.to_string(),
+        "embed" | "embedding" => PROVIDER_EMBEDDINGS.to_string(),
         other => other.to_string(),
     }
 }
@@ -537,4 +595,12 @@ fn read_kv(path: &PathBuf) -> Vec<(String, String)> {
             Some((key, value))
         })
         .collect()
+}
+
+fn config_bool(value: &str, default: bool) -> bool {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" | "enabled" => true,
+        "0" | "false" | "no" | "off" | "disabled" => false,
+        _ => default,
+    }
 }

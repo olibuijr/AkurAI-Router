@@ -4,29 +4,50 @@ use std::path::PathBuf;
 use crate::accounts::{self, BillingConfig, RouterUser, UsageSummary};
 use crate::auth;
 use crate::config::{
-    Config, Model, Provider, canonical_provider_id, default_provider_auth_path,
-    infer_model_provider_id, load_models, load_providers, model_id_for_provider,
-    provider_display_name, public_model_id, save_models, save_providers,
+    Config, DEFAULT_EMBEDDING_MODEL, DEFAULT_EMBEDDING_UPSTREAM_URL, EmbeddingConfig, Model,
+    PROVIDER_EMBEDDINGS, Provider, canonical_provider_id, default_provider_auth_path,
+    infer_model_provider_id, load_embedding_config, load_models, load_providers,
+    model_id_for_provider, provider_display_name, public_model_id, save_embedding_config,
+    save_models, save_providers,
 };
 use crate::http::{self, Request};
 use crate::upstream;
 use crate::util::{html_escape, parse_query, query_get};
 
 const HERO: &[u8] = include_bytes!("../assets/hero.png");
+const FAVICON: &[u8] = include_bytes!("../assets/favicon.svg");
+const APPLE_TOUCH_ICON: &[u8] = include_bytes!("../assets/apple-touch-icon.png");
+const ROUTER_OG: &[u8] = include_bytes!("../assets/router-og.png");
 
 pub fn hero(stream: &mut TcpStream) {
+    send_cached_asset(stream, "image/png", HERO);
+}
+
+pub fn router_og(stream: &mut TcpStream) {
+    send_cached_asset(stream, "image/png", ROUTER_OG);
+}
+
+pub fn favicon(stream: &mut TcpStream) {
+    send_cached_asset(stream, "image/svg+xml", FAVICON);
+}
+
+pub fn apple_touch_icon(stream: &mut TcpStream) {
+    send_cached_asset(stream, "image/png", APPLE_TOUCH_ICON);
+}
+
+fn send_cached_asset(stream: &mut TcpStream, content_type: &str, body: &[u8]) {
     let _ = http::send_response(
         stream,
         200,
         "OK",
         &[
-            ("Content-Type", "image/png".to_string()),
+            ("Content-Type", content_type.to_string()),
             (
                 "Cache-Control",
                 "public, max-age=31536000, immutable".to_string(),
             ),
         ],
-        HERO,
+        body,
     );
 }
 
@@ -43,10 +64,12 @@ pub fn landing(req: &Request, stream: &mut TcpStream, cfg: &Config) {
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="AkurAI Router is a std-only Rust OpenAI-compatible endpoint for Codex, Claude Code, and OpenCode Go routing.">
+  <meta name="description" content="AkurAI Router is a std-only Rust OpenAI-compatible endpoint for chat, responses, models, and embeddings.">
   <meta property="og:title" content="AkurAI Router">
   <meta property="og:description" content="A minimal Rust OpenAI-compatible router with provider-prefixed model routing.">
-  <meta property="og:image" content="{base}/assets/hero.png">
+  <meta property="og:image" content="{base}/assets/router-og.png">
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="/apple-touch-icon.png" sizes="180x180">
   <title>AkurAI Router</title>
   <script>{flash_js}</script>
   <style>{themes}{css}</style>
@@ -56,7 +79,7 @@ pub fn landing(req: &Request, stream: &mut TcpStream, cfg: &Config) {
     <img src="/assets/hero.png" alt="" class="hero-img">
     <div class="shade"></div>
     <nav>
-      <a class="brand" href="/">AkurAI Router</a>
+      <a class="brand" href="/"><img class="brand-icon" src="/favicon.svg" alt="">AkurAI<span class="brand-dim">/Router</span></a>
       <div>
         <a href="/v1/models">Models</a>
         <a href="https://github.com/olibuijr/AkurAI-Router">GitHub</a>
@@ -67,7 +90,7 @@ pub fn landing(req: &Request, stream: &mut TcpStream, cfg: &Config) {
     <section class="copy">
       <p class="eyebrow">OpenAI endpoint. Provider-prefixed routing.</p>
       <h1>AkurAI Router</h1>
-      <p class="lead">A small Rust service that exposes `/v1/responses`, `/v1/chat/completions`, and `/v1/models`, authenticates tools with a private API key, and routes requests to Codex, Claude Code, or OpenCode Go.</p>
+      <p class="lead">A small Rust service that exposes `/v1/responses`, `/v1/chat/completions`, `/v1/embeddings`, and `/v1/models`, authenticates tools with a private API key, and routes requests to Codex, Claude Code, OpenCode Go, or the selected embedding backend.</p>
       <div class="actions">
         <a class="button" href="/login">Log in with AkurAI IDP</a>
         <a class="button ghost" href="https://github.com/olibuijr/AkurAI-Router">Source</a>
@@ -78,7 +101,7 @@ pub fn landing(req: &Request, stream: &mut TcpStream, cfg: &Config) {
     <div class="grid">
       <div><h2>One binary</h2><p>Rust standard library server, embedded landing asset, local config files, and no Rust crate dependencies.</p></div>
       <div><h2>Protected API</h2><p>Tooling calls use `Authorization: Bearer ...`; the admin UI uses AkurAI IDP SSO and an email allowlist.</p></div>
-      <div><h2>Provider native</h2><p>Model IDs use `codex/`, `claude/`, and `opencode-go/` prefixes while upstream auth stays server-side.</p></div>
+      <div><h2>Provider native</h2><p>Model IDs use `codex/`, `claude/`, `opencode-go/`, and `embeddings/` prefixes while upstream auth stays server-side.</p></div>
     </div>
   </section>
   <script>{picker_js}</script>
@@ -106,6 +129,7 @@ pub fn admin(req: &Request, stream: &mut TcpStream, cfg: &Config) {
     let keys = accounts::load_client_keys(cfg);
     let billing = accounts::load_billing_config(cfg);
     let usage = accounts::usage_summaries(cfg);
+    let embedding = load_embedding_config(cfg);
     let auth_ok = providers.iter().any(|p| p.enabled && p.auth_path.exists());
     let total_requests: u64 = usage.iter().map(|u| u.requests).sum();
     let total_tokens: u64 = usage.iter().map(|u| u.total_tokens).sum();
@@ -212,12 +236,23 @@ pub fn admin(req: &Request, stream: &mut TcpStream, cfg: &Config) {
         })
         .collect::<Vec<_>>()
         .join("");
+    let embedding_model_options = embedding_model_options(&models, &embedding.model);
+    let embedding_status_class = if embedding.enabled && !embedding.upstream_url.trim().is_empty() {
+        "pill ok"
+    } else {
+        "pill warn"
+    };
+    let embedding_status = if embedding.enabled && !embedding.upstream_url.trim().is_empty() {
+        "enabled"
+    } else {
+        "disabled"
+    };
     let html = format!(
         r#"<!doctype html>
 <html lang="en" data-theme="">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>AkurAI Router Admin</title><script>{flash_js}</script><style>{themes}{css}</style></head>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><link rel="icon" href="/favicon.svg" type="image/svg+xml"><link rel="apple-touch-icon" href="/apple-touch-icon.png" sizes="180x180"><title>AkurAI Router Admin</title><script>{flash_js}</script><style>{themes}{css}</style></head>
 <body class="admin-body">
-<header class="topbar"><a class="brand" href="/">AkurAI Router</a><nav><span>{email}</span><a href="/logout">Log out</a><span data-theme-picker></span></nav></header>
+<header class="topbar"><a class="brand" href="/"><img class="brand-icon" src="/favicon.svg" alt="">AkurAI<span class="brand-dim">/Router</span></a><nav><span>{email}</span><a href="/logout">Log out</a><span data-theme-picker></span></nav></header>
 <main class="admin">
   <section class="panel wide">
     <div><p class="eyebrow">Endpoint</p><h1>{base}/v1</h1></div>
@@ -241,8 +276,20 @@ pub fn admin(req: &Request, stream: &mut TcpStream, cfg: &Config) {
     <ol class="steps">
       <li>Refresh Codex OAuth with `codex login` for the configured service account when renewal is required.</li>
       <li>Keep configured Codex, Claude Code, and OpenCode Go auth files readable only by the service account.</li>
-      <li>Configure clients with base URL `{base}/v1`, wire API `responses`, and the router API key from `/etc/akurai-router/router.env`.</li>
+      <li>Configure clients with base URL `{base}/v1`, wire responses, chat, embeddings, and the router API key from `/etc/akurai-router/router.env`.</li>
     </ol>
+  </section>
+
+  <section class="panel">
+    <div class="row-head"><h2>Embeddings</h2><span class="{embedding_status_class}">{embedding_status}</span></div>
+    <form method="post" action="/admin/embeddings/save" class="stack">
+      <label>Router endpoint<input value="{base}/v1/embeddings" readonly></label>
+      <label>Upstream URL<input name="upstream_url" value="{embedding_upstream_url}"></label>
+      <label>Model<select name="model">{embedding_model_options}</select></label>
+      <label class="check"><input type="checkbox" name="enabled" {embedding_checked}> Enabled</label>
+      <button>Save embeddings</button>
+    </form>
+    <p class="muted">OpenAI-compatible embedding requests are authenticated at the router and proxied to the selected backend model.</p>
   </section>
 
   <section class="panel wide">
@@ -310,6 +357,11 @@ pub fn admin(req: &Request, stream: &mut TcpStream, cfg: &Config) {
         key_rows = key_rows,
         user_options = user_options,
         model_rows = model_rows,
+        embedding_status_class = embedding_status_class,
+        embedding_status = embedding_status,
+        embedding_upstream_url = html_escape(&embedding.upstream_url),
+        embedding_model_options = embedding_model_options,
+        embedding_checked = if embedding.enabled { "checked" } else { "" },
     );
     let _ = http::send_text(stream, 200, "text/html; charset=utf-8", &html);
 }
@@ -455,9 +507,57 @@ pub fn admin_post(req: &Request, stream: &mut TcpStream, cfg: &Config) {
                 }
             }
         }
+        "/admin/embeddings/save" => {
+            let upstream_url = query_get(&form, "upstream_url")
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| DEFAULT_EMBEDDING_UPSTREAM_URL.to_string());
+            let model = query_get(&form, "model")
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| DEFAULT_EMBEDDING_MODEL.to_string());
+            let _ = save_embedding_config(
+                cfg,
+                &EmbeddingConfig {
+                    enabled: query_get(&form, "enabled").is_some(),
+                    upstream_url,
+                    model,
+                },
+            );
+        }
         _ => {}
     }
     let _ = http::redirect(stream, "/admin", &[]);
+}
+
+fn embedding_model_options(models: &[Model], selected: &str) -> String {
+    let mut rows = Vec::new();
+    for model in models
+        .iter()
+        .filter(|m| canonical_provider_id(&m.provider_id) == PROVIDER_EMBEDDINGS)
+    {
+        let value = model.upstream_id.clone();
+        let is_selected =
+            selected == value || selected == public_model_id(model) || selected == model.id;
+        rows.push(format!(
+            r#"<option value="{}" {}>{} ({})</option>"#,
+            html_escape(&value),
+            if is_selected { "selected" } else { "" },
+            html_escape(&model.name),
+            html_escape(&value),
+        ));
+    }
+    if !rows.iter().any(|row| row.contains(" selected>")) {
+        rows.insert(
+            0,
+            format!(
+                r#"<option value="{}" selected>{}</option>"#,
+                html_escape(selected),
+                html_escape(selected)
+            ),
+        );
+    }
+    rows.join("")
 }
 
 fn generated_key_page(
@@ -470,9 +570,9 @@ fn generated_key_page(
     let html = format!(
         r#"<!doctype html>
 <html lang="en" data-theme="">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>AkurAI Router Key</title><script>{flash_js}</script><style>{themes}{css}</style></head>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><link rel="icon" href="/favicon.svg" type="image/svg+xml"><link rel="apple-touch-icon" href="/apple-touch-icon.png" sizes="180x180"><title>AkurAI Router Key</title><script>{flash_js}</script><style>{themes}{css}</style></head>
 <body class="admin-body">
-<header class="topbar"><a class="brand" href="/">AkurAI Router</a><nav><span>{email}</span><a href="/admin">Admin</a><span data-theme-picker></span></nav></header>
+<header class="topbar"><a class="brand" href="/"><img class="brand-icon" src="/favicon.svg" alt="">AkurAI<span class="brand-dim">/Router</span></a><nav><span>{email}</span><a href="/admin">Admin</a><span data-theme-picker></span></nav></header>
 <main class="admin">
   <section class="panel wide">
     <p class="eyebrow">Router key created</p>
@@ -625,6 +725,6 @@ fn theme_picker_js() -> &'static str {
 // background (#f4f0e8) and white panels (#fff) are replaced by var(--bg) /
 // var(--panel) so the admin matches whatever theme is active suite-wide.
 fn style() -> &'static str {
-    r#"*{box-sizing:border-box}body{margin:0;font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:var(--bg);color:var(--fg)}a{color:inherit;text-decoration:none}nav{position:absolute;top:0;left:0;right:0;z-index:3;display:flex;align-items:center;justify-content:space-between;padding:22px clamp(20px,5vw,64px)}nav div{display:flex;gap:18px;align-items:center}.brand{font-weight:760;letter-spacing:0}.hero{position:relative;min-height:92vh;overflow:hidden;display:flex;align-items:center}.hero-img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}.shade{position:absolute;inset:0;background:linear-gradient(90deg,rgba(0,0,0,.82) 0%,rgba(0,0,0,.56) 38%,rgba(0,0,0,.18) 70%,rgba(0,0,0,.64) 100%)}.copy{position:relative;z-index:2;width:min(720px,92vw);margin-left:clamp(22px,6vw,86px);padding-top:36px}.eyebrow{font-size:13px;text-transform:uppercase;letter-spacing:.12em;color:var(--accent-2);font-weight:800}.copy h1{font-size:clamp(56px,8vw,120px);line-height:.92;margin:12px 0 22px;letter-spacing:0}.lead{font-size:clamp(18px,2vw,24px);line-height:1.5;color:var(--fg);opacity:.85;max-width:680px}.actions{display:flex;gap:12px;flex-wrap:wrap;margin-top:30px}.button,button{display:inline-flex;align-items:center;justify-content:center;min-height:42px;border:1px solid var(--accent);background:var(--accent);color:var(--bg);border-radius:var(--radius);padding:0 16px;font-weight:760;cursor:pointer;font:inherit}.button.secondary,.button.ghost{background:var(--panel);color:var(--fg);border-color:var(--border)}.band{background:var(--bg-2);color:var(--fg);padding:32px clamp(20px,5vw,64px) 64px}.grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:24px;max-width:1120px;margin:auto}.grid h2{font-size:20px;margin:0 0 8px}.grid p{margin:0;line-height:1.55;color:var(--muted)}.admin-body{background:var(--bg);color:var(--fg)}.topbar{display:flex;justify-content:space-between;align-items:center;padding:16px 24px;background:var(--bg-2);color:var(--fg);border-bottom:1px solid var(--border)}.topbar nav{position:static;padding:0;gap:16px}.topbar a{color:var(--muted)}.topbar a:hover{color:var(--fg)}.admin{padding:24px;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px}.panel{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);padding:20px;box-shadow:var(--shadow)}.panel.wide{grid-column:1/-1}.panel h1{font-size:24px;margin:2px 0 0;color:var(--fg);overflow-wrap:anywhere}.panel h2{font-size:18px;margin:0 0 14px}.muted,.steps{color:var(--muted);line-height:1.5}.status-row,.row-head{display:flex;justify-content:space-between;gap:12px;align-items:center}.metric-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin-top:16px}.metric{border:1px solid var(--border);border-radius:var(--radius);padding:12px;background:var(--bg-2)}.metric span{display:block;color:var(--muted);font-size:13px}.metric strong{display:block;font-size:22px;margin-top:4px}.pill{display:inline-flex;border-radius:99px;padding:6px 10px;font-size:13px;font-weight:780}.pill.ok{background:color-mix(in srgb,var(--ok) 18%,var(--panel));color:var(--ok)}.pill.warn{background:color-mix(in srgb,var(--warn) 18%,var(--panel));color:var(--warn)}.provider-list{display:grid;gap:12px}.provider-form{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.3fr) auto auto auto;gap:10px;align-items:end;padding:12px;border:1px solid var(--border);border-radius:var(--radius);background:var(--bg-2)}.provider-form strong{display:block;font-size:15px}.provider-main{display:grid;gap:4px;align-self:start}.stack{display:grid;gap:12px}.stack label,.provider-form label{display:grid;gap:6px;font-weight:700}.stack input,.inline-form input,.provider-form input,.mini-form input,.inline-form select{height:38px;border:1px solid var(--border);border-radius:6px;padding:0 10px;font:inherit;background:var(--bg);color:var(--fg)}.check{display:flex!important;grid-template-columns:auto 1fr;align-items:center}.check input{height:auto}.inline-form{display:grid;grid-template-columns:repeat(4,minmax(0,1fr)) auto;gap:8px;margin-top:14px}.key-add{grid-template-columns:minmax(0,1fr) minmax(0,1fr) auto}.user-add{grid-template-columns:minmax(0,1.2fr) minmax(0,1fr) minmax(120px,.5fr) auto auto}.mini-form{display:flex;gap:8px;align-items:end}.mini-form label{display:grid;gap:5px;font-size:13px;font-weight:700}.key-box{white-space:pre-wrap;overflow-wrap:anywhere;background:var(--bg);color:var(--accent-2);border:1px solid var(--border);border-radius:var(--radius);padding:14px;font-size:15px}table{width:100%;border-collapse:collapse;font-size:14px}td,th{border-bottom:1px solid var(--border);padding:10px;text-align:left}th{color:var(--muted)}.icon{min-height:30px;width:32px;padding:0;background:var(--panel);color:var(--danger);border-color:color-mix(in srgb,var(--danger) 30%,var(--border))}.theme-select{height:32px;padding:0 8px;border-radius:6px;border:1px solid var(--border);background:var(--panel);color:var(--fg);font:inherit;font-size:13px;cursor:pointer}@media(max-width:820px){.grid,.admin,.provider-form,.metric-grid{grid-template-columns:1fr}.copy h1{font-size:54px}.inline-form,.key-add,.user-add{grid-template-columns:1fr}.status-row,.row-head,.mini-form{display:grid}.topbar{display:grid;gap:10px}.hero{min-height:88vh}}
+    r#"*{box-sizing:border-box}body{margin:0;font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:var(--bg);color:var(--fg)}a{color:inherit;text-decoration:none}nav{position:absolute;top:0;left:0;right:0;z-index:3;display:flex;align-items:center;justify-content:space-between;padding:22px clamp(20px,5vw,64px)}nav div{display:flex;gap:18px;align-items:center}.brand{display:inline-flex;align-items:center;gap:9px;font-weight:760;letter-spacing:0}.brand-icon{width:30px;height:30px;border-radius:8px;box-shadow:0 8px 20px -10px rgba(0,0,0,.55);flex:none}.brand-dim{color:var(--muted);font-weight:660}.hero{position:relative;min-height:92vh;overflow:hidden;display:flex;align-items:center}.hero-img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}.shade{position:absolute;inset:0;background:linear-gradient(90deg,rgba(0,0,0,.82) 0%,rgba(0,0,0,.56) 38%,rgba(0,0,0,.18) 70%,rgba(0,0,0,.64) 100%)}.copy{position:relative;z-index:2;width:min(720px,92vw);margin-left:clamp(22px,6vw,86px);padding-top:36px}.eyebrow{font-size:13px;text-transform:uppercase;letter-spacing:.12em;color:var(--accent-2);font-weight:800}.copy h1{font-size:clamp(56px,8vw,120px);line-height:.92;margin:12px 0 22px;letter-spacing:0}.lead{font-size:clamp(18px,2vw,24px);line-height:1.5;color:var(--fg);opacity:.85;max-width:680px}.actions{display:flex;gap:12px;flex-wrap:wrap;margin-top:30px}.button,button{display:inline-flex;align-items:center;justify-content:center;min-height:42px;border:1px solid var(--accent);background:var(--accent);color:var(--bg);border-radius:var(--radius);padding:0 16px;font-weight:760;cursor:pointer;font:inherit}.button.secondary,.button.ghost{background:var(--panel);color:var(--fg);border-color:var(--border)}.band{background:var(--bg-2);color:var(--fg);padding:32px clamp(20px,5vw,64px) 64px}.grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:24px;max-width:1120px;margin:auto}.grid h2{font-size:20px;margin:0 0 8px}.grid p{margin:0;line-height:1.55;color:var(--muted)}.admin-body{background:var(--bg);color:var(--fg)}.topbar{display:flex;justify-content:space-between;align-items:center;padding:16px 24px;background:var(--bg-2);color:var(--fg);border-bottom:1px solid var(--border)}.topbar nav{position:static;padding:0;gap:16px}.topbar a{color:var(--muted)}.topbar .brand{color:var(--fg)}.topbar a:hover{color:var(--fg)}.admin{padding:24px;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px}.panel{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);padding:20px;box-shadow:var(--shadow)}.panel.wide{grid-column:1/-1}.panel h1{font-size:24px;margin:2px 0 0;color:var(--fg);overflow-wrap:anywhere}.panel h2{font-size:18px;margin:0 0 14px}.muted,.steps{color:var(--muted);line-height:1.5}.status-row,.row-head{display:flex;justify-content:space-between;gap:12px;align-items:center}.metric-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin-top:16px}.metric{border:1px solid var(--border);border-radius:var(--radius);padding:12px;background:var(--bg-2)}.metric span{display:block;color:var(--muted);font-size:13px}.metric strong{display:block;font-size:22px;margin-top:4px}.pill{display:inline-flex;border-radius:99px;padding:6px 10px;font-size:13px;font-weight:780}.pill.ok{background:color-mix(in srgb,var(--ok) 18%,var(--panel));color:var(--ok)}.pill.warn{background:color-mix(in srgb,var(--warn) 18%,var(--panel));color:var(--warn)}.provider-list{display:grid;gap:12px}.provider-form{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.3fr) auto auto auto;gap:10px;align-items:end;padding:12px;border:1px solid var(--border);border-radius:var(--radius);background:var(--bg-2)}.provider-form strong{display:block;font-size:15px}.provider-main{display:grid;gap:4px;align-self:start}.stack{display:grid;gap:12px}.stack label,.provider-form label{display:grid;gap:6px;font-weight:700}.stack input,.stack select,.inline-form input,.provider-form input,.mini-form input,.inline-form select{height:38px;border:1px solid var(--border);border-radius:6px;padding:0 10px;font:inherit;background:var(--bg);color:var(--fg)}.check{display:flex!important;grid-template-columns:auto 1fr;align-items:center}.check input{height:auto}.inline-form{display:grid;grid-template-columns:repeat(4,minmax(0,1fr)) auto;gap:8px;margin-top:14px}.key-add{grid-template-columns:minmax(0,1fr) minmax(0,1fr) auto}.user-add{grid-template-columns:minmax(0,1.2fr) minmax(0,1fr) minmax(120px,.5fr) auto auto}.mini-form{display:flex;gap:8px;align-items:end}.mini-form label{display:grid;gap:5px;font-size:13px;font-weight:700}.key-box{white-space:pre-wrap;overflow-wrap:anywhere;background:var(--bg);color:var(--accent-2);border:1px solid var(--border);border-radius:var(--radius);padding:14px;font-size:15px}table{width:100%;border-collapse:collapse;font-size:14px}td,th{border-bottom:1px solid var(--border);padding:10px;text-align:left}th{color:var(--muted)}.icon{min-height:30px;width:32px;padding:0;background:var(--panel);color:var(--danger);border-color:color-mix(in srgb,var(--danger) 30%,var(--border))}.theme-select{height:32px;padding:0 8px;border-radius:6px;border:1px solid var(--border);background:var(--panel);color:var(--fg);font:inherit;font-size:13px;cursor:pointer}@media(max-width:820px){.grid,.admin,.provider-form,.metric-grid{grid-template-columns:1fr}.copy h1{font-size:54px}.inline-form,.key-add,.user-add{grid-template-columns:1fr}.status-row,.row-head,.mini-form{display:grid}.topbar{display:grid;gap:10px}.hero{min-height:88vh}}
 "#
 }

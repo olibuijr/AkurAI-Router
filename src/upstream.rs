@@ -8,8 +8,9 @@ use std::process::{Command, Stdio};
 use crate::accounts::{self, UsageRecord};
 use crate::auth::ApiActor;
 use crate::config::{
-    Config, PROVIDER_CLAUDE, PROVIDER_CODEX, PROVIDER_OPENCODE_GO, canonical_provider_id,
-    default_provider_auth_path, is_opencode_go_messages_model, load_models, load_providers,
+    Config, EmbeddingConfig, PROVIDER_CLAUDE, PROVIDER_CODEX, PROVIDER_EMBEDDINGS,
+    PROVIDER_OPENCODE_GO, canonical_provider_id, default_provider_auth_path,
+    is_opencode_go_messages_model, load_embedding_config, load_models, load_providers,
     model_id_for_provider, public_model_id, split_model_provider_prefix,
 };
 use crate::http;
@@ -74,7 +75,88 @@ pub fn forward_model(req: &http::Request, stream: &mut TcpStream, cfg: &Config, 
     match provider_id.as_str() {
         PROVIDER_CLAUDE => forward_claude(req, stream, cfg, actor),
         PROVIDER_OPENCODE_GO => forward_opencode_go(req, stream, cfg, actor),
+        PROVIDER_EMBEDDINGS => {
+            let _ = http::send_json(
+                stream,
+                400,
+                &error_json("embedding models support /v1/embeddings"),
+            );
+        }
         _ => forward_codex(req, stream, cfg, actor),
+    }
+}
+
+pub fn forward_embeddings(
+    req: &http::Request,
+    stream: &mut TcpStream,
+    cfg: &Config,
+    actor: &ApiActor,
+) {
+    let embedding = load_embedding_config(cfg);
+    if !embedding.enabled {
+        let _ = http::send_json(stream, 503, &error_json("embedding endpoint is disabled"));
+        return;
+    }
+    if embedding.upstream_url.trim().is_empty() {
+        let _ = http::send_json(
+            stream,
+            503,
+            &error_json("embedding upstream URL is not configured"),
+        );
+        return;
+    }
+    let mut body = match json::parse(&String::from_utf8_lossy(&req.body)) {
+        Ok(value) => value,
+        Err(e) => {
+            let _ = http::send_json(stream, 400, &error_json(&e));
+            return;
+        }
+    };
+    let requested_model = body
+        .get_str("model")
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| embedding.model.clone());
+    body.set(
+        "model",
+        Json::String(resolve_embedding_model(cfg, &embedding, &requested_model)),
+    );
+    let body_text = body.stringify();
+    let headers = vec![
+        ("Content-Type", "application/json".to_string()),
+        ("Accept", "application/json".to_string()),
+    ];
+    match curl_capture(
+        "POST",
+        embedding.upstream_url.trim(),
+        &headers,
+        body_text.as_bytes(),
+        120,
+    ) {
+        Ok(resp) => {
+            let text = String::from_utf8_lossy(&resp.body);
+            record_usage(
+                cfg,
+                actor,
+                PROVIDER_EMBEDDINGS,
+                &requested_model,
+                &req.path,
+                resp.status,
+                Some(&text),
+            );
+            let _ = http::send_json(stream, resp.status, &text);
+        }
+        Err(e) => {
+            record_usage(
+                cfg,
+                actor,
+                PROVIDER_EMBEDDINGS,
+                &requested_model,
+                &req.path,
+                502,
+                None,
+            );
+            let _ = http::send_json(stream, 502, &error_json(&e));
+        }
     }
 }
 
@@ -1109,6 +1191,28 @@ fn resolve_model_id_for_provider(cfg: &Config, model: &str, provider_id: &str) -
     model
 }
 
+fn resolve_embedding_model(cfg: &Config, embedding: &EmbeddingConfig, requested: &str) -> String {
+    let requested = requested.trim();
+    if requested.is_empty() {
+        return embedding.model.clone();
+    }
+    let bare = model_id_for_provider(requested, PROVIDER_EMBEDDINGS);
+    for configured in load_models(cfg) {
+        if canonical_provider_id(&configured.provider_id) != PROVIDER_EMBEDDINGS {
+            continue;
+        }
+        if configured.id == bare
+            || configured.id == requested
+            || configured.upstream_id == bare
+            || configured.upstream_id == requested
+            || public_model_id(&configured) == requested
+        {
+            return configured.upstream_id;
+        }
+    }
+    requested.to_string()
+}
+
 fn runtime_os() -> &'static str {
     match std::env::consts::OS {
         "linux" => "Linux",
@@ -1607,6 +1711,7 @@ mod tests {
         assert!(ids.contains(&"claude/claude-opus-4-8"));
         assert!(ids.contains(&"opencode-go/glm-5.2"));
         assert!(ids.contains(&"opencode-go/qwen3.7-plus"));
+        assert!(ids.contains(&"embeddings/multilingual-e5-small"));
     }
 
     #[test]
@@ -1628,6 +1733,29 @@ mod tests {
         assert_eq!(
             provider_for_model(&cfg, "ocg/qwen3.7-plus"),
             PROVIDER_OPENCODE_GO
+        );
+        assert_eq!(
+            provider_for_model(&cfg, "embeddings/multilingual-e5-small"),
+            PROVIDER_EMBEDDINGS
+        );
+    }
+
+    #[test]
+    fn embedding_models_resolve_to_configured_upstream_ids() {
+        let cfg = test_config("embedding-models");
+        ensure_default_files(&cfg).unwrap();
+        let embedding = load_embedding_config(&cfg);
+        assert_eq!(
+            embedding.model,
+            crate::config::DEFAULT_EMBEDDING_MODEL.to_string()
+        );
+        assert_eq!(
+            resolve_embedding_model(&cfg, &embedding, "embeddings/multilingual-e5-small"),
+            crate::config::DEFAULT_EMBEDDING_MODEL
+        );
+        assert_eq!(
+            resolve_embedding_model(&cfg, &embedding, crate::config::DEFAULT_EMBEDDING_MODEL),
+            crate::config::DEFAULT_EMBEDDING_MODEL
         );
     }
 

@@ -54,6 +54,9 @@ fn dispatch(req: Request, stream: &mut std::net::TcpStream, cfg: &Config) {
     match (req.method.as_str(), req.path.as_str()) {
         ("GET", "/") => landing::landing(&req, stream, cfg),
         ("GET", "/assets/hero.png") => landing::hero(stream),
+        ("GET", "/assets/router-og.png") => landing::router_og(stream),
+        ("GET", "/favicon.svg") => landing::favicon(stream),
+        ("GET", "/apple-touch-icon.png") => landing::apple_touch_icon(stream),
         ("GET", "/health") => {
             let _ = http::send_json(stream, 200, "{\"ok\":true,\"service\":\"akurai-router\"}");
         }
@@ -69,6 +72,14 @@ fn dispatch(req: Request, stream: &mut std::net::TcpStream, cfg: &Config) {
                 return;
             }
             let _ = http::send_json(stream, 200, &upstream::models_json(cfg));
+        }
+        ("POST", "/v1/embeddings") | ("POST", "/api/v1/embeddings") => {
+            let Some(actor) = auth::authenticate_api_key(&req, cfg) else {
+                let _ =
+                    http::send_json(stream, 401, "{\"error\":{\"message\":\"invalid API key\"}}");
+                return;
+            };
+            upstream::forward_embeddings(&req, stream, cfg, &actor);
         }
         ("POST", "/v1/responses")
         | ("POST", "/api/v1/responses")
@@ -286,6 +297,9 @@ Environment:
   AKURAI_ROUTER_CLAUDE_AUTH_PATH=/home/olafurbui/.claude/.credentials.json
   AKURAI_ROUTER_OPENCODE_GO_AUTH_PATH=/home/olafurbui/.local/share/opencode/auth.json
   AKURAI_ROUTER_IDP_ISSUER=https://auth.olibuijr.com
+  AKURAI_ROUTER_EMBEDDINGS_URL=http://127.0.0.1:8081/v1/embeddings
+  AKURAI_ROUTER_EMBEDDINGS_MODEL=intfloat/multilingual-e5-small
+  AKURAI_ROUTER_EMBEDDINGS_ENABLED=true
   AKURAI_ROUTER_IDP_CLIENT_ID=...
   AKURAI_ROUTER_IDP_CLIENT_SECRET=...
   AKURAI_ROUTER_ADMIN_EMAIL=olibuijr@olibuijr.com

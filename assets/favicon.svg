@@ -1,0 +1,163 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" role="img" aria-labelledby="title desc">
+  <title id="title">AkurAI Router adaptive favicon</title>
+  <desc id="desc">Theme-adaptive SVG favicon for Router.</desc>
+  <style>
+    .dark-art { display: none; }
+    @media (prefers-color-scheme: dark) {
+      .light-art { display: none; }
+      .dark-art { display: inline; }
+    }
+  </style>
+  <defs>
+  <path id="squircle" d="M512 56 C681 56 775 56 843 105 C908 152 934 214 956 330 C971 409 971 615 956 694 C934 810 908 872 843 919 C775 968 681 968 512 968 C343 968 249 968 181 919 C116 872 90 810 68 694 C53 615 53 409 68 330 C90 214 116 152 181 105 C249 56 343 56 512 56Z"/>
+
+  <clipPath id="clip-light">
+    <use href="#squircle"/>
+  </clipPath>
+  <linearGradient id="baseGrad-light" x1="184" y1="68" x2="840" y2="962" gradientUnits="userSpaceOnUse">
+    <stop offset="0" stop-color="#FBFCFE"/>
+    <stop offset="0.45" stop-color="#ECEFF5"/>
+    <stop offset="1" stop-color="#D1DBE5"/>
+  </linearGradient>
+  <linearGradient id="topSheen-light" x1="512" y1="56" x2="512" y2="430" gradientUnits="userSpaceOnUse">
+    <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.92"/>
+    <stop offset="0.72" stop-color="#FFFFFF" stop-opacity="0"/>
+  </linearGradient>
+  <linearGradient id="bottomShade-light" x1="512" y1="606" x2="512" y2="968" gradientUnits="userSpaceOnUse">
+    <stop offset="0" stop-color="#000000" stop-opacity="0"/>
+    <stop offset="1" stop-color="#000000" stop-opacity="0.12"/>
+  </linearGradient>
+  <radialGradient id="accentBloom-light" cx="790" cy="784" r="560" gradientUnits="userSpaceOnUse">
+    <stop offset="0" stop-color="#A39FF1" stop-opacity="0.18"/>
+    <stop offset="0.45" stop-color="#645CE8" stop-opacity="0.0756"/>
+    <stop offset="1" stop-color="#3E37B3" stop-opacity="0"/>
+  </radialGradient>
+  <linearGradient id="edgeStroke-light" x1="512" y1="56" x2="512" y2="968" gradientUnits="userSpaceOnUse">
+    <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.62"/>
+    <stop offset="0.52" stop-color="#FFFFFF" stop-opacity="0.06"/>
+    <stop offset="1" stop-color="#0B1A14" stop-opacity="0.11"/>
+  </linearGradient>
+  <linearGradient id="glyphGrad-light" x1="512" y1="192" x2="512" y2="832" gradientUnits="userSpaceOnUse">
+    <stop offset="0" stop-color="#6F67EA"/>
+    <stop offset="0.52" stop-color="#4F46E5"/>
+    <stop offset="1" stop-color="#3932A5"/>
+  </linearGradient>
+  <linearGradient id="furrowGrad-light" x1="354" y1="604" x2="670" y2="604" gradientUnits="userSpaceOnUse">
+    <stop offset="0" stop-color="#24C2A3"/>
+    <stop offset="1" stop-color="#0E9F6E"/>
+  </linearGradient>
+  <filter id="outerShadow-light" x="-72" y="-52" width="1168" height="1172" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+    <feGaussianBlur in="SourceAlpha" stdDeviation="24" result="blur"/>
+    <feOffset in="blur" dy="24" result="offset"/>
+    <feFlood flood-color="#000000" flood-opacity="0.18" result="color"/>
+    <feComposite in="color" in2="offset" operator="in"/>
+  </filter>
+  <filter id="glyphLift-light" x="-28%" y="-28%" width="156%" height="172%" color-interpolation-filters="sRGB">
+    <feGaussianBlur in="SourceAlpha" stdDeviation="8" result="blur"/>
+    <feOffset in="blur" dy="9" result="offset"/>
+    <feFlood flood-color="#161440" flood-opacity="0.22" result="color"/>
+    <feComposite in="color" in2="offset" operator="in" result="shadow"/>
+    <feMerge>
+      <feMergeNode in="shadow"/>
+      <feMergeNode in="SourceGraphic"/>
+    </feMerge>
+  </filter>
+  <filter id="glyphGlow-light" x="-36%" y="-36%" width="172%" height="172%" color-interpolation-filters="sRGB">
+    <feGaussianBlur stdDeviation="16"/>
+  </filter>
+
+  <clipPath id="clip-dark">
+    <use href="#squircle"/>
+  </clipPath>
+  <linearGradient id="baseGrad-dark" x1="184" y1="68" x2="840" y2="962" gradientUnits="userSpaceOnUse">
+    <stop offset="0" stop-color="#2D313C"/>
+    <stop offset="0.45" stop-color="#171B22"/>
+    <stop offset="1" stop-color="#0B0D17"/>
+  </linearGradient>
+  <linearGradient id="topSheen-dark" x1="512" y1="56" x2="512" y2="430" gradientUnits="userSpaceOnUse">
+    <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.18"/>
+    <stop offset="0.72" stop-color="#FFFFFF" stop-opacity="0"/>
+  </linearGradient>
+  <linearGradient id="bottomShade-dark" x1="512" y1="606" x2="512" y2="968" gradientUnits="userSpaceOnUse">
+    <stop offset="0" stop-color="#000000" stop-opacity="0"/>
+    <stop offset="1" stop-color="#000000" stop-opacity="0.28"/>
+  </linearGradient>
+  <radialGradient id="accentBloom-dark" cx="790" cy="784" r="560" gradientUnits="userSpaceOnUse">
+    <stop offset="0" stop-color="#8B85EE" stop-opacity="0.36"/>
+    <stop offset="0.45" stop-color="#6158E8" stop-opacity="0.1512"/>
+    <stop offset="1" stop-color="#463ECA" stop-opacity="0"/>
+  </radialGradient>
+  <linearGradient id="edgeStroke-dark" x1="512" y1="56" x2="512" y2="968" gradientUnits="userSpaceOnUse">
+    <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.62"/>
+    <stop offset="0.52" stop-color="#FFFFFF" stop-opacity="0.06"/>
+    <stop offset="1" stop-color="#000000" stop-opacity="0.38"/>
+  </linearGradient>
+  <linearGradient id="glyphGrad-dark" x1="512" y1="192" x2="512" y2="832" gradientUnits="userSpaceOnUse">
+    <stop offset="0" stop-color="#FFFFFF"/>
+    <stop offset="0.52" stop-color="#E8EDFA"/>
+    <stop offset="1" stop-color="#BBD2E5"/>
+  </linearGradient>
+  <linearGradient id="furrowGrad-dark" x1="354" y1="604" x2="670" y2="604" gradientUnits="userSpaceOnUse">
+    <stop offset="0" stop-color="#4CCDB4"/>
+    <stop offset="1" stop-color="#00B894"/>
+  </linearGradient>
+  <filter id="outerShadow-dark" x="-72" y="-52" width="1168" height="1172" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+    <feGaussianBlur in="SourceAlpha" stdDeviation="24" result="blur"/>
+    <feOffset in="blur" dy="24" result="offset"/>
+    <feFlood flood-color="#000000" flood-opacity="0.32" result="color"/>
+    <feComposite in="color" in2="offset" operator="in"/>
+  </filter>
+  <filter id="glyphLift-dark" x="-28%" y="-28%" width="156%" height="172%" color-interpolation-filters="sRGB">
+    <feGaussianBlur in="SourceAlpha" stdDeviation="8" result="blur"/>
+    <feOffset in="blur" dy="9" result="offset"/>
+    <feFlood flood-color="#4F46E5" flood-opacity="0.46" result="color"/>
+    <feComposite in="color" in2="offset" operator="in" result="shadow"/>
+    <feMerge>
+      <feMergeNode in="shadow"/>
+      <feMergeNode in="SourceGraphic"/>
+    </feMerge>
+  </filter>
+  <filter id="glyphGlow-dark" x="-36%" y="-36%" width="172%" height="172%" color-interpolation-filters="sRGB">
+    <feGaussianBlur stdDeviation="16"/>
+  </filter>
+  </defs>
+  <g class="light-art">
+
+  <use href="#squircle" fill="#000000" filter="url(#outerShadow-light)"/>
+  <g clip-path="url(#clip-light)">
+    <use href="#squircle" fill="url(#baseGrad-light)"/>
+    <circle cx="790" cy="782" r="560" fill="url(#accentBloom-light)"/>
+    <ellipse cx="512" cy="82" rx="488" ry="250" fill="url(#topSheen-light)"/>
+    <rect x="56" y="604" width="912" height="364" fill="url(#bottomShade-light)"/>
+    <path d="M112 268C154 136 266 86 512 86s358 50 400 182" fill="none" stroke="#FFFFFF" stroke-width="7" stroke-linecap="round" opacity="0.42"/>
+  </g>
+  <use href="#squircle" fill="none" stroke="url(#edgeStroke-light)" stroke-width="2.4"/>
+  <g transform="translate(192 192) scale(20)" filter="url(#glyphLift-light)" shape-rendering="geometricPrecision">
+    <path d="M13 12h6a2 2 0 0 1 2 2v4a2 2 0 0 1-2 2h-6a2 2 0 0 1-2-2v-4a2 2 0 0 1 2-2Z" fill="url(#glyphGrad-light)"/>
+    <path d="M5 5h5a2 2 0 0 1 2 2v2H8v3H5V5Zm17 0h5v7h-3V9h-4V7a2 2 0 0 1 2-2ZM5 20h3v3h4v2a2 2 0 0 1-2 2H5v-7Zm19 3v-3h3v7h-5a2 2 0 0 1-2-2v-2h4Z" fill="url(#glyphGrad-light)"/>
+    <path d="M9 8h5a1.5 1.5 0 0 1 0 3H9V8Zm9 0h5v3h-5a1.5 1.5 0 0 1 0-3Zm-9 13h5a1.5 1.5 0 0 1 0 3H9v-3Zm9 0h5v3h-5a1.5 1.5 0 0 1 0-3Z" fill="url(#glyphGrad-light)"/>
+  </g>
+  </g>
+  <g class="dark-art">
+
+  <use href="#squircle" fill="#000000" filter="url(#outerShadow-dark)"/>
+  <g clip-path="url(#clip-dark)">
+    <use href="#squircle" fill="url(#baseGrad-dark)"/>
+    <circle cx="790" cy="782" r="560" fill="url(#accentBloom-dark)"/>
+    <ellipse cx="512" cy="82" rx="488" ry="250" fill="url(#topSheen-dark)"/>
+    <rect x="56" y="604" width="912" height="364" fill="url(#bottomShade-dark)"/>
+    <path d="M112 268C154 136 266 86 512 86s358 50 400 182" fill="none" stroke="#FFFFFF" stroke-width="7" stroke-linecap="round" opacity="0.12"/>
+  </g>
+  <use href="#squircle" fill="none" stroke="url(#edgeStroke-dark)" stroke-width="2.4"/>
+  <g transform="translate(192 192) scale(20)" filter="url(#glyphGlow-dark)" opacity="0.28">
+    <path d="M13 12h6a2 2 0 0 1 2 2v4a2 2 0 0 1-2 2h-6a2 2 0 0 1-2-2v-4a2 2 0 0 1 2-2Z" fill="#4F46E5"/>
+    <path d="M5 5h5a2 2 0 0 1 2 2v2H8v3H5V5Zm17 0h5v7h-3V9h-4V7a2 2 0 0 1 2-2ZM5 20h3v3h4v2a2 2 0 0 1-2 2H5v-7Zm19 3v-3h3v7h-5a2 2 0 0 1-2-2v-2h4Z" fill="#4F46E5"/>
+    <path d="M9 8h5a1.5 1.5 0 0 1 0 3H9V8Zm9 0h5v3h-5a1.5 1.5 0 0 1 0-3Zm-9 13h5a1.5 1.5 0 0 1 0 3H9v-3Zm9 0h5v3h-5a1.5 1.5 0 0 1 0-3Z" fill="#4F46E5"/>
+  </g>
+  <g transform="translate(192 192) scale(20)" filter="url(#glyphLift-dark)" shape-rendering="geometricPrecision">
+    <path d="M13 12h6a2 2 0 0 1 2 2v4a2 2 0 0 1-2 2h-6a2 2 0 0 1-2-2v-4a2 2 0 0 1 2-2Z" fill="url(#glyphGrad-dark)"/>
+    <path d="M5 5h5a2 2 0 0 1 2 2v2H8v3H5V5Zm17 0h5v7h-3V9h-4V7a2 2 0 0 1 2-2ZM5 20h3v3h4v2a2 2 0 0 1-2 2H5v-7Zm19 3v-3h3v7h-5a2 2 0 0 1-2-2v-2h4Z" fill="url(#glyphGrad-dark)"/>
+    <path d="M9 8h5a1.5 1.5 0 0 1 0 3H9V8Zm9 0h5v3h-5a1.5 1.5 0 0 1 0-3Zm-9 13h5a1.5 1.5 0 0 1 0 3H9v-3Zm9 0h5v3h-5a1.5 1.5 0 0 1 0-3Z" fill="url(#glyphGrad-dark)"/>
+  </g>
+  </g>
+</svg>
