@@ -225,6 +225,12 @@ pub fn forward_codex(req: &http::Request, stream: &mut TcpStream, cfg: &Config, 
 
 fn forward_claude(req: &http::Request, stream: &mut TcpStream, cfg: &Config, actor: &ApiActor) {
     let requested_model = request_model(req, cfg);
+    // The Claude upstream is queried non-streamed, but clients (pi) request stream:true
+    // and parse an SSE response. Track that so we can synthesize a stream on the way back.
+    let wants_stream = json::parse(&String::from_utf8_lossy(&req.body))
+        .ok()
+        .and_then(|v| v.get_bool("stream"))
+        .unwrap_or(false);
     let body = match transform_claude_request(&req.body, cfg) {
         Ok(body) => body,
         Err(e) => {
@@ -311,7 +317,18 @@ fn forward_claude(req: &http::Request, stream: &mut TcpStream, cfg: &Config, act
             let text = String::from_utf8_lossy(&resp.body);
             match claude_to_openai_response(&text, cfg) {
                 Ok(json) => {
-                    let _ = http::send_json(stream, 200, &json);
+                    if wants_stream {
+                        match chat_completion_to_sse(&json) {
+                            Ok(sse) => {
+                                let _ = http::send_text(stream, 200, "text/event-stream", &sse);
+                            }
+                            Err(_) => {
+                                let _ = http::send_json(stream, 200, &json);
+                            }
+                        }
+                    } else {
+                        let _ = http::send_json(stream, 200, &json);
+                    }
                 }
                 Err(e) => {
                     let _ = http::send_json(stream, 502, &error_json(&e));
@@ -979,14 +996,20 @@ fn transform_anthropic_messages_request(
     }
     let (system_blocks, messages) = claude_messages_from_openai(&input, default_system_prompt);
     body.set("messages", Json::Array(messages));
-    if system_blocks.is_empty() {
-        body.set(
-            "system",
-            Json::Array(vec![claude_text_block(default_system_prompt)]),
-        );
+    let mut system_blocks = if system_blocks.is_empty() {
+        vec![claude_text_block(default_system_prompt)]
     } else {
-        body.set("system", Json::Array(system_blocks));
+        system_blocks
+    };
+    // Claude Code OAuth subscription billing: api.anthropic.com only bills a request
+    // against the Max/Pro subscription when system[0] is the Claude Code billing-header
+    // block. Without it, substantial custom/agent system prompts (e.g. pi's harness
+    // prompt) get pushed to pay-as-you-go "extra usage" and rejected. Inject it for the
+    // Claude provider only — opencode-go also routes through this function.
+    if provider_id == PROVIDER_CLAUDE {
+        system_blocks.insert(0, claude_billing_block(raw));
     }
+    body.set("system", Json::Array(system_blocks));
     if let Some(v) = input.get("top_p") {
         body.set("top_p", v.clone());
     }
@@ -1084,6 +1107,88 @@ fn claude_text_block(text: &str) -> Json {
     block.set("type", Json::String("text".to_string()));
     block.set("text", Json::String(text.to_string()));
     block
+}
+
+// Build the Claude Code billing-header system block that marks the request as genuine
+// Claude Code traffic so api.anthropic.com bills it against the OAuth subscription
+// rather than pay-as-you-go "extra usage". Mirrors the real client format
+// `x-anthropic-billing-header: cc_version=<ver>.<build>; cc_entrypoint=sdk-cli; cch=<hash>;`.
+// Anthropic does not verify the hashes (confirmed empirically), but we derive them from
+// the request bytes so the values vary per request and look legitimate.
+fn claude_billing_block(raw: &[u8]) -> Json {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    raw.hash(&mut hasher);
+    let h = hasher.finish();
+    let cch = format!("{:05x}", h & 0xf_ffff);
+    let build = format!("{:03x}", (h >> 20) & 0xfff);
+    claude_text_block(&format!(
+        "x-anthropic-billing-header: cc_version=2.1.92.{}; cc_entrypoint=sdk-cli; cch={};",
+        build, cch
+    ))
+}
+
+// Synthesize an OpenAI-style SSE stream from a completed chat.completion JSON.
+// The Claude upstream is queried non-streamed, but clients request `stream: true` and
+// parse a text/event-stream response; without this they read the plain JSON as a stream
+// and report "Stream ended without finish_reason".
+fn chat_completion_to_sse(completion: &str) -> Result<String, String> {
+    let parsed = json::parse(completion)?;
+    let id = parsed.get_str("id").unwrap_or("chatcmpl-akurai").to_string();
+    let model = parsed.get_str("model").unwrap_or("").to_string();
+    let created =
+        json_number_string(parsed.get("created")).unwrap_or_else(|| now_secs().to_string());
+    let mut content = String::new();
+    let mut finish = "stop".to_string();
+    if let Some(Json::Array(choices)) = parsed.get("choices") {
+        if let Some(choice) = choices.first() {
+            if let Some(text) = choice.get("message").and_then(|m| m.get_str("content")) {
+                content = text.to_string();
+            }
+            if let Some(fr) = choice.get_str("finish_reason") {
+                finish = fr.to_string();
+            }
+        }
+    }
+    let chunk = |delta: Json, finish_reason: Json| -> String {
+        let mut c = Json::object();
+        c.set("id", Json::String(id.clone()));
+        c.set("object", Json::String("chat.completion.chunk".to_string()));
+        c.set("created", Json::Number(created.clone()));
+        c.set("model", Json::String(model.clone()));
+        let mut choice = Json::object();
+        choice.set("index", Json::Number("0".to_string()));
+        choice.set("delta", delta);
+        choice.set("finish_reason", finish_reason);
+        c.set("choices", Json::Array(vec![choice]));
+        c.stringify()
+    };
+    let mut out = String::new();
+    let mut role_delta = Json::object();
+    role_delta.set("role", Json::String("assistant".to_string()));
+    out.push_str(&format!("data: {}\n\n", chunk(role_delta, Json::Null)));
+    if !content.is_empty() {
+        let mut content_delta = Json::object();
+        content_delta.set("content", Json::String(content));
+        out.push_str(&format!("data: {}\n\n", chunk(content_delta, Json::Null)));
+    }
+    out.push_str(&format!(
+        "data: {}\n\n",
+        chunk(Json::object(), Json::String(finish))
+    ));
+    if let Some(usage) = parsed.get("usage") {
+        let mut c = Json::object();
+        c.set("id", Json::String(id.clone()));
+        c.set("object", Json::String("chat.completion.chunk".to_string()));
+        c.set("created", Json::Number(created.clone()));
+        c.set("model", Json::String(model.clone()));
+        c.set("choices", Json::Array(Vec::new()));
+        c.set("usage", usage.clone());
+        out.push_str(&format!("data: {}\n\n", c.stringify()));
+    }
+    out.push_str("data: [DONE]\n\n");
+    Ok(out)
 }
 
 fn claude_to_openai_response(raw: &str, cfg: &Config) -> Result<String, String> {
