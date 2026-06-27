@@ -1,0 +1,10 @@
+name = "akurai-router"
+domain = "akurai-router.olibuijr.com"
+port = 4219
+repo = "olibuijr/AkurAI-Router"
+build = "cargo build --release --target x86_64-unknown-linux-musl"
+artifact = "target/x86_64-unknown-linux-musl/release/akurai-router"
+cargo_version = "package"
+gate_fmt = true
+gate_clippy = true
+gate_test = true
