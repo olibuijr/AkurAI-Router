@@ -63,7 +63,9 @@ fn dispatch(req: Request, stream: &mut std::net::TcpStream, cfg: &Config) {
         ("GET", "/login") => oauth::login(&req, stream, cfg),
         ("GET", "/auth/callback") => oauth::callback(&req, stream, cfg),
         ("GET", "/logout") => landing::logout(&req, stream, cfg),
-        ("GET", "/admin") => landing::admin(&req, stream, cfg),
+        ("GET", p) if p == "/admin" || p.starts_with("/admin/") => {
+            landing::admin(&req, stream, cfg)
+        }
         ("POST", p) if p.starts_with("/admin/") => landing::admin_post(&req, stream, cfg),
         ("GET", "/v1/models") | ("GET", "/api/v1/models") => {
             if auth::authenticate_api_key(&req, cfg).is_none() {

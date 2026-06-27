@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Deploy conduct: run from a reviewable local tree, keep runtime secrets on the host,
+# and rely on the built-in systemd restart plus /health smoke after install.
 set -euo pipefail
 
 TARGET="x86_64-unknown-linux-musl"

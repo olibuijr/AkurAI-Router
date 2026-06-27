@@ -19,6 +19,72 @@ const FAVICON: &[u8] = include_bytes!("../assets/favicon.svg");
 const APPLE_TOUCH_ICON: &[u8] = include_bytes!("../assets/apple-touch-icon.png");
 const ROUTER_OG: &[u8] = include_bytes!("../assets/router-og.png");
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AdminSection {
+    Overview,
+    Providers,
+    Embeddings,
+    Users,
+    Keys,
+    Models,
+}
+
+impl AdminSection {
+    fn from_path(path: &str) -> Option<Self> {
+        match path {
+            "/admin" | "/admin/overview" => Some(Self::Overview),
+            "/admin/providers" => Some(Self::Providers),
+            "/admin/embeddings" => Some(Self::Embeddings),
+            "/admin/users" => Some(Self::Users),
+            "/admin/keys" => Some(Self::Keys),
+            "/admin/models" => Some(Self::Models),
+            _ => None,
+        }
+    }
+
+    fn path(self) -> &'static str {
+        match self {
+            Self::Overview => "/admin",
+            Self::Providers => "/admin/providers",
+            Self::Embeddings => "/admin/embeddings",
+            Self::Users => "/admin/users",
+            Self::Keys => "/admin/keys",
+            Self::Models => "/admin/models",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Overview => "Overview",
+            Self::Providers => "Providers",
+            Self::Embeddings => "Embeddings",
+            Self::Users => "Users & Billing",
+            Self::Keys => "Keys",
+            Self::Models => "Models",
+        }
+    }
+
+    fn detail(self) -> &'static str {
+        match self {
+            Self::Overview => "Endpoint health, totals, and operator reminders.",
+            Self::Providers => "OAuth file paths and upstream provider readiness.",
+            Self::Embeddings => "Embedding upstream endpoint and selected backend model.",
+            Self::Users => "IDP users, request totals, and shared-cost allocation.",
+            Self::Keys => "Assigned router keys, ownership, and revocation controls.",
+            Self::Models => "Catalog sync, model aliases, and routing ownership.",
+        }
+    }
+}
+
+const ADMIN_SECTIONS: [AdminSection; 6] = [
+    AdminSection::Overview,
+    AdminSection::Providers,
+    AdminSection::Embeddings,
+    AdminSection::Users,
+    AdminSection::Keys,
+    AdminSection::Models,
+];
+
 pub fn hero(stream: &mut TcpStream) {
     send_cached_asset(stream, "image/png", HERO);
 }
@@ -122,6 +188,10 @@ pub fn admin(req: &Request, stream: &mut TcpStream, cfg: &Config) {
         let _ = http::redirect(stream, "/login", &[]);
         return;
     };
+    let Some(section) = AdminSection::from_path(&req.path) else {
+        let _ = http::redirect(stream, "/admin", &[]);
+        return;
+    };
     let _ = accounts::ensure_account_files(cfg);
     let providers = load_providers(cfg);
     let models = load_models(cfg);
@@ -135,6 +205,11 @@ pub fn admin(req: &Request, stream: &mut TcpStream, cfg: &Config) {
     let total_tokens: u64 = usage.iter().map(|u| u.total_tokens).sum();
     let total_direct_cost: f64 = usage.iter().map(|u| u.cost_usd).sum();
     let active_keys = keys.iter().filter(|k| k.enabled).count();
+    let enabled_users = users.iter().filter(|u| u.enabled).count();
+    let ready_providers = providers
+        .iter()
+        .filter(|p| p.enabled && p.auth_path.exists())
+        .count();
     let provider_rows = providers
         .iter()
         .map(|p| {
@@ -171,6 +246,14 @@ pub fn admin(req: &Request, stream: &mut TcpStream, cfg: &Config) {
         })
         .collect::<Vec<_>>()
         .join("");
+    let total_allocated_cost: f64 = users
+        .iter()
+        .map(|user| {
+            let summary = usage_summary_for(&usage, &user.email);
+            summary.cost_usd
+                + billing.monthly_shared_cost_usd * user.cost_share_pct.max(0.0) / 100.0
+        })
+        .sum();
     let user_rows = users
         .iter()
         .map(|user| {
@@ -236,7 +319,6 @@ pub fn admin(req: &Request, stream: &mut TcpStream, cfg: &Config) {
         })
         .collect::<Vec<_>>()
         .join("");
-    let embedding_model_options = embedding_model_options(&models, &embedding.model);
     let embedding_status_class = if embedding.enabled && !embedding.upstream_url.trim().is_empty() {
         "pill ok"
     } else {
@@ -247,84 +329,77 @@ pub fn admin(req: &Request, stream: &mut TcpStream, cfg: &Config) {
     } else {
         "disabled"
     };
+    let sidebar_links = ADMIN_SECTIONS
+        .iter()
+        .map(|item| {
+            let active = if *item == section { "active" } else { "" };
+            format!(
+                r#"<a class="sidebar-link {active}" href="{path}"><strong>{label}</strong><span>{detail}</span></a>"#,
+                active = active,
+                path = item.path(),
+                label = item.label(),
+                detail = item.detail(),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    let content = match section {
+        AdminSection::Overview => render_admin_overview(
+            cfg,
+            &session,
+            auth_ok,
+            ready_providers,
+            providers.len(),
+            enabled_users,
+            total_requests,
+            total_tokens,
+            total_direct_cost,
+            active_keys,
+            embedding_status_class,
+            embedding_status,
+        ),
+        AdminSection::Providers => {
+            render_admin_providers(&provider_rows, auth_ok, ready_providers, providers.len())
+        }
+        AdminSection::Embeddings => render_admin_embeddings(
+            cfg,
+            &models,
+            &embedding,
+            embedding_status_class,
+            embedding_status,
+        ),
+        AdminSection::Users => {
+            render_admin_users(&users, &usage, &billing, &user_rows, total_allocated_cost)
+        }
+        AdminSection::Keys => render_admin_keys(&key_rows, &user_options, active_keys),
+        AdminSection::Models => render_admin_models(&model_rows, models.len()),
+    };
     let html = format!(
         r#"<!doctype html>
 <html lang="en" data-theme="">
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><link rel="icon" href="/favicon.svg" type="image/svg+xml"><link rel="apple-touch-icon" href="/apple-touch-icon.png" sizes="180x180"><title>AkurAI Router Admin</title><script>{flash_js}</script><style>{themes}{css}</style></head>
 <body class="admin-body">
 <header class="topbar"><a class="brand" href="/"><img class="brand-icon" src="/favicon.svg" alt="">AkurAI<span class="brand-dim">/Router</span></a><nav><span>{email}</span><a href="/logout">Log out</a><span data-theme-picker></span></nav></header>
-<main class="admin">
-  <section class="panel wide">
-    <div><p class="eyebrow">Endpoint</p><h1>{base}/v1</h1></div>
-    <div class="status-row"><span class="{status_class}">{status}</span><span>Session expires at {expires}</span></div>
-    <div class="metric-grid">
-      <div class="metric"><span>Requests</span><strong>{total_requests}</strong></div>
-      <div class="metric"><span>Tokens</span><strong>{total_tokens}</strong></div>
-      <div class="metric"><span>Direct cost</span><strong>{total_direct_cost}</strong></div>
-      <div class="metric"><span>Active keys</span><strong>{active_keys}</strong></div>
+<main class="admin-shell">
+  <aside class="sidebar">
+    <div class="sidebar-block">
+      <p class="eyebrow">Admin workspace</p>
+      <h1>{base}/v1</h1>
+      <p class="muted">Separate settings pages for provider auth, embeddings, users, keys, and model routing.</p>
+      <div class="status-stack">
+        <span class="{status_class}">{status}</span>
+        <span class="sidebar-note">Session expires at {expires}</span>
+      </div>
     </div>
-  </section>
-
-  <section class="panel">
-    <h2>Providers</h2>
-    <div class="provider-list">{provider_rows}</div>
-    <p class="muted">{provider_hint}</p>
-  </section>
-
-  <section class="panel">
-    <h2>Login Setup</h2>
-    <ol class="steps">
-      <li>Refresh Codex OAuth with `codex login` for the configured service account when renewal is required.</li>
-      <li>Keep configured Codex, Claude Code, and OpenCode Go auth files readable only by the service account.</li>
-      <li>Configure clients with base URL `{base}/v1`, wire responses, chat, embeddings, and the router API key from `/etc/akurai-router/router.env`.</li>
-    </ol>
-  </section>
-
-  <section class="panel">
-    <div class="row-head"><h2>Embeddings</h2><span class="{embedding_status_class}">{embedding_status}</span></div>
-    <form method="post" action="/admin/embeddings/save" class="stack">
-      <label>Router endpoint<input value="{base}/v1/embeddings" readonly></label>
-      <label>Upstream URL<input name="upstream_url" value="{embedding_upstream_url}"></label>
-      <label>Model<select name="model">{embedding_model_options}</select></label>
-      <label class="check"><input type="checkbox" name="enabled" {embedding_checked}> Enabled</label>
-      <button>Save embeddings</button>
-    </form>
-    <p class="muted">OpenAI-compatible embedding requests are authenticated at the router and proxied to the selected backend model.</p>
-  </section>
-
-  <section class="panel wide">
-    <div class="row-head"><h2>IDP Users and Cost Allocation</h2><form method="post" action="/admin/billing/save" class="mini-form"><label>Monthly shared cost USD<input name="monthly_shared_cost_usd" type="number" min="0" step="0.0001" value="{monthly_shared_cost}"></label><button>Save</button></form></div>
-    <table><thead><tr><th>Email</th><th>Name</th><th>Status</th><th>Share</th><th>Requests</th><th>Tokens</th><th>Direct cost</th><th>Allocated total</th></tr></thead><tbody>{user_rows}</tbody></table>
-    <form method="post" action="/admin/users/save" class="inline-form user-add">
-      <input name="email" placeholder="idp user email">
-      <input name="name" placeholder="display name">
-      <input name="cost_share_pct" type="number" min="0" max="100" step="0.01" placeholder="cost share %">
-      <label class="check"><input type="checkbox" name="enabled" checked> Enabled</label>
-      <button>Add/update user</button>
-    </form>
-  </section>
-
-  <section class="panel wide">
-    <h2>Assigned Router Keys</h2>
-    <table><thead><tr><th>ID</th><th>Owner</th><th>Name</th><th>Key</th><th>Status</th><th>Last used</th><th></th></tr></thead><tbody>{key_rows}</tbody></table>
-    <form method="post" action="/admin/keys/create" class="inline-form key-add">
-      <select name="email">{user_options}</select>
-      <input name="name" placeholder="key label">
-      <button>Create key</button>
-    </form>
-  </section>
-
-  <section class="panel wide">
-    <div class="row-head"><h2>Models</h2><form method="post" action="/admin/models/sync"><button>Sync provider catalogs</button></form></div>
-    <table><thead><tr><th>ID</th><th>Name</th><th>Upstream</th><th>Provider</th><th>Status</th><th></th></tr></thead><tbody>{model_rows}</tbody></table>
-    <form method="post" action="/admin/models/add" class="inline-form">
-      <input name="id" placeholder="model id">
-      <input name="name" placeholder="display name">
-      <input name="upstream_id" placeholder="upstream id">
-      <input name="provider_id" placeholder="provider id">
-      <button>Add model</button>
-    </form>
-  </section>
+    <nav class="sidebar-nav">{sidebar_links}</nav>
+    <div class="sidebar-block sidebar-summary">
+      <div><span>Provider auth</span><strong>{ready_providers}/{provider_count}</strong></div>
+      <div><span>Enabled users</span><strong>{enabled_users}</strong></div>
+      <div><span>Active keys</span><strong>{active_keys}</strong></div>
+      <div><span>Embedding route</span><strong>{embedding_status}</strong></div>
+    </div>
+  </aside>
+  <section class="workspace">{content}</section>
 </main>
 <script>{picker_js}</script>
 </body>
@@ -342,28 +417,293 @@ pub fn admin(req: &Request, stream: &mut TcpStream, cfg: &Config) {
         } else {
             "Provider auth missing"
         },
-        total_requests = format_u64(total_requests),
-        total_tokens = format_u64(total_tokens),
-        total_direct_cost = money(total_direct_cost),
         active_keys = active_keys,
-        monthly_shared_cost = format!("{:.4}", billing.monthly_shared_cost_usd),
+        embedding_status = embedding_status,
+        enabled_users = enabled_users,
+        ready_providers = ready_providers,
+        provider_count = providers.len(),
+        sidebar_links = sidebar_links,
+        content = content,
+    );
+    let _ = http::send_text(stream, 200, "text/html; charset=utf-8", &html);
+}
+
+fn render_admin_overview(
+    cfg: &Config,
+    session: &auth::AdminSession,
+    auth_ok: bool,
+    ready_providers: usize,
+    provider_count: usize,
+    enabled_users: usize,
+    total_requests: u64,
+    total_tokens: u64,
+    total_direct_cost: f64,
+    active_keys: usize,
+    embedding_status_class: &str,
+    embedding_status: &str,
+) -> String {
+    format!(
+        r#"
+<section class="page-header">
+  <div>
+    <p class="eyebrow">Router admin</p>
+    <h2>Overview</h2>
+    <p class="muted">Operational summary for the public router endpoint and its managed settings surfaces.</p>
+  </div>
+</section>
+<section class="workspace-grid">
+  <article class="panel">
+    <div class="row-head"><h3>Endpoint</h3><span class="{status_class}">{status}</span></div>
+    <p class="endpoint">{base}/v1</p>
+    <div class="metric-grid">
+      <div class="metric"><span>Requests</span><strong>{requests}</strong></div>
+      <div class="metric"><span>Tokens</span><strong>{tokens}</strong></div>
+      <div class="metric"><span>Direct cost</span><strong>{cost}</strong></div>
+      <div class="metric"><span>Active keys</span><strong>{active_keys}</strong></div>
+    </div>
+  </article>
+  <article class="panel">
+    <div class="row-head"><h3>Coverage</h3><span class="{embedding_status_class}">{embedding_status}</span></div>
+    <dl class="detail-list">
+      <div><dt>Ready providers</dt><dd>{ready_providers}/{provider_count}</dd></div>
+      <div><dt>Enabled users</dt><dd>{enabled_users}</dd></div>
+      <div><dt>Admin allowlist</dt><dd>{admin_email}</dd></div>
+      <div><dt>Session expiry</dt><dd>{expires}</dd></div>
+    </dl>
+  </article>
+  <article class="panel wide">
+    <h3>Operator reminders</h3>
+    <ol class="steps">
+      <li>Refresh Codex OAuth with `codex login` for the configured service account when renewal is required.</li>
+      <li>Keep configured Codex, Claude Code, and OpenCode Go auth files readable only by the service account.</li>
+      <li>Configure clients with base URL `{base}/v1`, use `{base}/v1/embeddings` for shared embeddings, and keep router secrets in `/etc/akurai-router/router.env` only.</li>
+    </ol>
+  </article>
+</section>"#,
+        status_class = if auth_ok { "pill ok" } else { "pill warn" },
+        status = if auth_ok {
+            "Provider auth found"
+        } else {
+            "Provider auth missing"
+        },
+        base = html_escape(&cfg.public_base_url),
+        requests = format_u64(total_requests),
+        tokens = format_u64(total_tokens),
+        cost = money(total_direct_cost),
+        active_keys = active_keys,
+        embedding_status_class = embedding_status_class,
+        embedding_status = embedding_status,
+        ready_providers = ready_providers,
+        provider_count = provider_count,
+        enabled_users = enabled_users,
+        admin_email = html_escape(&cfg.admin_allowed_email),
+        expires = session.expires_at,
+    )
+}
+
+fn render_admin_providers(
+    provider_rows: &str,
+    auth_ok: bool,
+    ready_providers: usize,
+    provider_count: usize,
+) -> String {
+    format!(
+        r#"
+<section class="page-header">
+  <div>
+    <p class="eyebrow">Provider routing</p>
+    <h2>Providers</h2>
+    <p class="muted">Set the local OAuth or auth.json path for each upstream and control whether the router can send traffic there.</p>
+  </div>
+</section>
+<section class="workspace-grid">
+  <article class="panel wide">
+    <div class="row-head"><h3>Provider auth files</h3><span class="{status_class}">{ready_providers}/{provider_count} ready</span></div>
+    <div class="provider-list">{provider_rows}</div>
+  </article>
+  <article class="panel">
+    <h3>Path expectations</h3>
+    <p class="muted">{provider_hint}</p>
+  </article>
+  <article class="panel">
+    <h3>Auth posture</h3>
+    <p class="muted">Readable auth material should stay on disk only for the service account. Do not mirror tokens into repo files, logs, screenshots, or browser tools.</p>
+    <dl class="detail-list compact">
+      <div><dt>Codex</dt><dd>~/.codex/auth.json</dd></div>
+      <div><dt>Claude Code</dt><dd>~/.claude/.credentials.json</dd></div>
+      <div><dt>OpenCode Go</dt><dd>~/.local/share/opencode/auth.json</dd></div>
+    </dl>
+  </article>
+</section>"#,
+        status_class = if auth_ok { "pill ok" } else { "pill warn" },
+        ready_providers = ready_providers,
+        provider_count = provider_count,
+        provider_rows = provider_rows,
         provider_hint = if auth_ok {
             "Keep each provider auth file readable only by the service account. Codex uses ~/.codex/auth.json; Claude Code uses ~/.claude/.credentials.json; OpenCode Go uses ~/.local/share/opencode/auth.json."
         } else {
             "Point each provider at the correct local auth file. Codex uses ~/.codex/auth.json; Claude Code uses ~/.claude/.credentials.json; OpenCode Go uses ~/.local/share/opencode/auth.json."
         },
-        provider_rows = provider_rows,
-        user_rows = user_rows,
-        key_rows = key_rows,
-        user_options = user_options,
-        model_rows = model_rows,
+    )
+}
+
+fn render_admin_embeddings(
+    cfg: &Config,
+    models: &[Model],
+    embedding: &EmbeddingConfig,
+    embedding_status_class: &str,
+    embedding_status: &str,
+) -> String {
+    format!(
+        r#"
+<section class="page-header">
+  <div>
+    <p class="eyebrow">Shared embeddings</p>
+    <h2>Embeddings</h2>
+    <p class="muted">Route OpenAI-compatible embedding requests through the router with one managed upstream target and model selection.</p>
+  </div>
+</section>
+<section class="workspace-grid">
+  <article class="panel">
+    <div class="row-head"><h3>Embedding route</h3><span class="{embedding_status_class}">{embedding_status}</span></div>
+    <form method="post" action="/admin/embeddings/save" class="stack">
+      <label>Router endpoint<input value="{base}/v1/embeddings" readonly></label>
+      <label>Upstream URL<input name="upstream_url" value="{embedding_upstream_url}"></label>
+      <label>Model<select name="model">{embedding_model_options}</select></label>
+      <label class="check"><input type="checkbox" name="enabled" {embedding_checked}> Enabled</label>
+      <button>Save embeddings</button>
+    </form>
+  </article>
+  <article class="panel">
+    <h3>Routing notes</h3>
+    <p class="muted">Embedding requests authenticate at the router, the selected public model is normalized to the configured upstream model, and chat or responses requests using an embedding model are rejected before proxying.</p>
+    <dl class="detail-list compact">
+      <div><dt>Public endpoint</dt><dd>{base}/v1/embeddings</dd></div>
+      <div><dt>Alias</dt><dd>{base}/api/v1/embeddings</dd></div>
+      <div><dt>Stored config</dt><dd>embeddings.conf</dd></div>
+    </dl>
+  </article>
+</section>"#,
         embedding_status_class = embedding_status_class,
         embedding_status = embedding_status,
+        base = html_escape(&cfg.public_base_url),
         embedding_upstream_url = html_escape(&embedding.upstream_url),
-        embedding_model_options = embedding_model_options,
+        embedding_model_options = embedding_model_options(models, &embedding.model),
         embedding_checked = if embedding.enabled { "checked" } else { "" },
-    );
-    let _ = http::send_text(stream, 200, "text/html; charset=utf-8", &html);
+    )
+}
+
+fn render_admin_users(
+    users: &[RouterUser],
+    usage: &[UsageSummary],
+    billing: &BillingConfig,
+    user_rows: &str,
+    total_allocated_cost: f64,
+) -> String {
+    format!(
+        r#"
+<section class="page-header">
+  <div>
+    <p class="eyebrow">Access and billing</p>
+    <h2>Users & Billing</h2>
+    <p class="muted">Manage which IDP users can receive router keys, how shared cost is allocated, and the request totals attributed to each user.</p>
+  </div>
+</section>
+<section class="workspace-grid">
+  <article class="panel wide">
+    <div class="row-head"><h3>IDP users and cost allocation</h3><form method="post" action="/admin/billing/save" class="mini-form"><label>Monthly shared cost USD<input name="monthly_shared_cost_usd" type="number" min="0" step="0.0001" value="{monthly_shared_cost}"></label><button>Save</button></form></div>
+    <table><thead><tr><th>Email</th><th>Name</th><th>Status</th><th>Share</th><th>Requests</th><th>Tokens</th><th>Direct cost</th><th>Allocated total</th></tr></thead><tbody>{user_rows}</tbody></table>
+    <form method="post" action="/admin/users/save" class="inline-form user-add">
+      <input name="email" placeholder="idp user email">
+      <input name="name" placeholder="display name">
+      <input name="cost_share_pct" type="number" min="0" max="100" step="0.01" placeholder="cost share %">
+      <label class="check"><input type="checkbox" name="enabled" checked> Enabled</label>
+      <button>Add/update user</button>
+    </form>
+  </article>
+  <article class="panel">
+    <h3>Allocation totals</h3>
+    <dl class="detail-list">
+      <div><dt>Tracked users</dt><dd>{user_count}</dd></div>
+      <div><dt>Usage summaries</dt><dd>{usage_count}</dd></div>
+      <div><dt>Shared monthly cost</dt><dd>{monthly_shared_cost_money}</dd></div>
+      <div><dt>Allocated total</dt><dd>{allocated_total}</dd></div>
+    </dl>
+  </article>
+</section>"#,
+        monthly_shared_cost = format!("{:.4}", billing.monthly_shared_cost_usd),
+        user_rows = user_rows,
+        user_count = users.len(),
+        usage_count = usage.len(),
+        monthly_shared_cost_money = money(billing.monthly_shared_cost_usd),
+        allocated_total = money(total_allocated_cost),
+    )
+}
+
+fn render_admin_keys(key_rows: &str, user_options: &str, active_keys: usize) -> String {
+    format!(
+        r#"
+<section class="page-header">
+  <div>
+    <p class="eyebrow">Assigned credentials</p>
+    <h2>Keys</h2>
+    <p class="muted">Create one-time router keys for enabled users, audit ownership, and revoke or re-enable existing assignments.</p>
+  </div>
+</section>
+<section class="workspace-grid">
+  <article class="panel wide">
+    <div class="row-head"><h3>Assigned router keys</h3><span class="pill ok">{active_keys} active</span></div>
+    <table><thead><tr><th>ID</th><th>Owner</th><th>Name</th><th>Key</th><th>Status</th><th>Last used</th><th></th></tr></thead><tbody>{key_rows}</tbody></table>
+    <form method="post" action="/admin/keys/create" class="inline-form key-add">
+      <select name="email">{user_options}</select>
+      <input name="name" placeholder="key label">
+      <button>Create key</button>
+    </form>
+  </article>
+  <article class="panel">
+    <h3>Key handling</h3>
+    <p class="muted">Generated router keys are shown only on creation. After that, only the non-sensitive hint remains visible here for audit and ownership tracking.</p>
+  </article>
+</section>"#,
+        active_keys = active_keys,
+        key_rows = key_rows,
+        user_options = user_options,
+    )
+}
+
+fn render_admin_models(model_rows: &str, model_count: usize) -> String {
+    format!(
+        r#"
+<section class="page-header">
+  <div>
+    <p class="eyebrow">Catalog management</p>
+    <h2>Models</h2>
+    <p class="muted">Manage public model aliases, upstream ownership, and provider catalog sync for chat and responses routing.</p>
+  </div>
+</section>
+<section class="workspace-grid">
+  <article class="panel wide">
+    <div class="row-head"><h3>Configured models</h3><form method="post" action="/admin/models/sync"><button>Sync provider catalogs</button></form></div>
+    <table><thead><tr><th>ID</th><th>Name</th><th>Upstream</th><th>Provider</th><th>Status</th><th></th></tr></thead><tbody>{model_rows}</tbody></table>
+    <form method="post" action="/admin/models/add" class="inline-form">
+      <input name="id" placeholder="model id">
+      <input name="name" placeholder="display name">
+      <input name="upstream_id" placeholder="upstream id">
+      <input name="provider_id" placeholder="provider id">
+      <button>Add model</button>
+    </form>
+  </article>
+  <article class="panel">
+    <h3>Catalog status</h3>
+    <dl class="detail-list">
+      <div><dt>Configured models</dt><dd>{model_count}</dd></div>
+      <div><dt>Accepted prefixes</dt><dd>codex/, claude/, opencode-go/, embeddings/</dd></div>
+    </dl>
+  </article>
+</section>"#,
+        model_rows = model_rows,
+        model_count = model_count,
+    )
 }
 
 pub fn admin_post(req: &Request, stream: &mut TcpStream, cfg: &Config) {
@@ -527,7 +867,7 @@ pub fn admin_post(req: &Request, stream: &mut TcpStream, cfg: &Config) {
         }
         _ => {}
     }
-    let _ = http::redirect(stream, "/admin", &[]);
+    let _ = http::redirect(stream, admin_redirect_path(&req.path), &[]);
 }
 
 fn embedding_model_options(models: &[Model], selected: &str) -> String {
@@ -572,14 +912,14 @@ fn generated_key_page(
 <html lang="en" data-theme="">
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><link rel="icon" href="/favicon.svg" type="image/svg+xml"><link rel="apple-touch-icon" href="/apple-touch-icon.png" sizes="180x180"><title>AkurAI Router Key</title><script>{flash_js}</script><style>{themes}{css}</style></head>
 <body class="admin-body">
-<header class="topbar"><a class="brand" href="/"><img class="brand-icon" src="/favicon.svg" alt="">AkurAI<span class="brand-dim">/Router</span></a><nav><span>{email}</span><a href="/admin">Admin</a><span data-theme-picker></span></nav></header>
+<header class="topbar"><a class="brand" href="/"><img class="brand-icon" src="/favicon.svg" alt="">AkurAI<span class="brand-dim">/Router</span></a><nav><span>{email}</span><a href="/admin/keys">Keys</a><span data-theme-picker></span></nav></header>
 <main class="admin">
   <section class="panel wide">
     <p class="eyebrow">Router key created</p>
     <h1>{key_id}</h1>
     <p class="muted">This key is shown once. Store it in the client secret manager, then use it as `Authorization: Bearer ...` against `{base}/v1`.</p>
     <pre class="key-box">{key}</pre>
-    <a class="button" href="/admin">Return to admin</a>
+    <a class="button" href="/admin/keys">Return to keys</a>
   </section>
 </main>
 <script>{picker_js}</script>
@@ -606,6 +946,17 @@ fn usage_summary_for(summaries: &[UsageSummary], email: &str) -> UsageSummary {
             email: email.to_string(),
             ..UsageSummary::default()
         })
+}
+
+fn admin_redirect_path(path: &str) -> &'static str {
+    match path {
+        "/admin/provider/save" => "/admin/providers",
+        "/admin/embeddings/save" => "/admin/embeddings",
+        "/admin/users/save" | "/admin/billing/save" => "/admin/users",
+        "/admin/keys/revoke" => "/admin/keys",
+        "/admin/models/add" | "/admin/models/remove" | "/admin/models/sync" => "/admin/models",
+        _ => "/admin",
+    }
 }
 
 fn money(value: f64) -> String {
@@ -725,6 +1076,137 @@ fn theme_picker_js() -> &'static str {
 // background (#f4f0e8) and white panels (#fff) are replaced by var(--bg) /
 // var(--panel) so the admin matches whatever theme is active suite-wide.
 fn style() -> &'static str {
-    r#"*{box-sizing:border-box}body{margin:0;font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:var(--bg);color:var(--fg)}a{color:inherit;text-decoration:none}nav{position:absolute;top:0;left:0;right:0;z-index:3;display:flex;align-items:center;justify-content:space-between;padding:22px clamp(20px,5vw,64px)}nav div{display:flex;gap:18px;align-items:center}.brand{display:inline-flex;align-items:center;gap:9px;font-weight:760;letter-spacing:0}.brand-icon{width:30px;height:30px;border-radius:8px;box-shadow:0 8px 20px -10px rgba(0,0,0,.55);flex:none}.brand-dim{color:var(--muted);font-weight:660}.hero{position:relative;min-height:92vh;overflow:hidden;display:flex;align-items:center}.hero-img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}.shade{position:absolute;inset:0;background:linear-gradient(90deg,rgba(0,0,0,.82) 0%,rgba(0,0,0,.56) 38%,rgba(0,0,0,.18) 70%,rgba(0,0,0,.64) 100%)}.copy{position:relative;z-index:2;width:min(720px,92vw);margin-left:clamp(22px,6vw,86px);padding-top:36px}.eyebrow{font-size:13px;text-transform:uppercase;letter-spacing:.12em;color:var(--accent-2);font-weight:800}.copy h1{font-size:clamp(56px,8vw,120px);line-height:.92;margin:12px 0 22px;letter-spacing:0}.lead{font-size:clamp(18px,2vw,24px);line-height:1.5;color:var(--fg);opacity:.85;max-width:680px}.actions{display:flex;gap:12px;flex-wrap:wrap;margin-top:30px}.button,button{display:inline-flex;align-items:center;justify-content:center;min-height:42px;border:1px solid var(--accent);background:var(--accent);color:var(--bg);border-radius:var(--radius);padding:0 16px;font-weight:760;cursor:pointer;font:inherit}.button.secondary,.button.ghost{background:var(--panel);color:var(--fg);border-color:var(--border)}.band{background:var(--bg-2);color:var(--fg);padding:32px clamp(20px,5vw,64px) 64px}.grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:24px;max-width:1120px;margin:auto}.grid h2{font-size:20px;margin:0 0 8px}.grid p{margin:0;line-height:1.55;color:var(--muted)}.admin-body{background:var(--bg);color:var(--fg)}.topbar{display:flex;justify-content:space-between;align-items:center;padding:16px 24px;background:var(--bg-2);color:var(--fg);border-bottom:1px solid var(--border)}.topbar nav{position:static;padding:0;gap:16px}.topbar a{color:var(--muted)}.topbar .brand{color:var(--fg)}.topbar a:hover{color:var(--fg)}.admin{padding:24px;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px}.panel{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);padding:20px;box-shadow:var(--shadow)}.panel.wide{grid-column:1/-1}.panel h1{font-size:24px;margin:2px 0 0;color:var(--fg);overflow-wrap:anywhere}.panel h2{font-size:18px;margin:0 0 14px}.muted,.steps{color:var(--muted);line-height:1.5}.status-row,.row-head{display:flex;justify-content:space-between;gap:12px;align-items:center}.metric-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin-top:16px}.metric{border:1px solid var(--border);border-radius:var(--radius);padding:12px;background:var(--bg-2)}.metric span{display:block;color:var(--muted);font-size:13px}.metric strong{display:block;font-size:22px;margin-top:4px}.pill{display:inline-flex;border-radius:99px;padding:6px 10px;font-size:13px;font-weight:780}.pill.ok{background:color-mix(in srgb,var(--ok) 18%,var(--panel));color:var(--ok)}.pill.warn{background:color-mix(in srgb,var(--warn) 18%,var(--panel));color:var(--warn)}.provider-list{display:grid;gap:12px}.provider-form{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.3fr) auto auto auto;gap:10px;align-items:end;padding:12px;border:1px solid var(--border);border-radius:var(--radius);background:var(--bg-2)}.provider-form strong{display:block;font-size:15px}.provider-main{display:grid;gap:4px;align-self:start}.stack{display:grid;gap:12px}.stack label,.provider-form label{display:grid;gap:6px;font-weight:700}.stack input,.stack select,.inline-form input,.provider-form input,.mini-form input,.inline-form select{height:38px;border:1px solid var(--border);border-radius:6px;padding:0 10px;font:inherit;background:var(--bg);color:var(--fg)}.check{display:flex!important;grid-template-columns:auto 1fr;align-items:center}.check input{height:auto}.inline-form{display:grid;grid-template-columns:repeat(4,minmax(0,1fr)) auto;gap:8px;margin-top:14px}.key-add{grid-template-columns:minmax(0,1fr) minmax(0,1fr) auto}.user-add{grid-template-columns:minmax(0,1.2fr) minmax(0,1fr) minmax(120px,.5fr) auto auto}.mini-form{display:flex;gap:8px;align-items:end}.mini-form label{display:grid;gap:5px;font-size:13px;font-weight:700}.key-box{white-space:pre-wrap;overflow-wrap:anywhere;background:var(--bg);color:var(--accent-2);border:1px solid var(--border);border-radius:var(--radius);padding:14px;font-size:15px}table{width:100%;border-collapse:collapse;font-size:14px}td,th{border-bottom:1px solid var(--border);padding:10px;text-align:left}th{color:var(--muted)}.icon{min-height:30px;width:32px;padding:0;background:var(--panel);color:var(--danger);border-color:color-mix(in srgb,var(--danger) 30%,var(--border))}.theme-select{height:32px;padding:0 8px;border-radius:6px;border:1px solid var(--border);background:var(--panel);color:var(--fg);font:inherit;font-size:13px;cursor:pointer}@media(max-width:820px){.grid,.admin,.provider-form,.metric-grid{grid-template-columns:1fr}.copy h1{font-size:54px}.inline-form,.key-add,.user-add{grid-template-columns:1fr}.status-row,.row-head,.mini-form{display:grid}.topbar{display:grid;gap:10px}.hero{min-height:88vh}}
+    r#"*{box-sizing:border-box}
+body{margin:0;font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:var(--bg);color:var(--fg)}
+a{color:inherit;text-decoration:none}
+nav{position:absolute;top:0;left:0;right:0;z-index:3;display:flex;align-items:center;justify-content:space-between;padding:22px clamp(20px,5vw,64px)}
+nav div{display:flex;gap:18px;align-items:center}
+.brand{display:inline-flex;align-items:center;gap:9px;font-weight:760;letter-spacing:0}
+.brand-icon{width:30px;height:30px;border-radius:8px;box-shadow:0 8px 20px -10px rgba(0,0,0,.55);flex:none}
+.brand-dim{color:var(--muted);font-weight:660}
+.hero{position:relative;min-height:92vh;overflow:hidden;display:flex;align-items:center}
+.hero-img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
+.shade{position:absolute;inset:0;background:linear-gradient(90deg,rgba(0,0,0,.82) 0%,rgba(0,0,0,.56) 38%,rgba(0,0,0,.18) 70%,rgba(0,0,0,.64) 100%)}
+.copy{position:relative;z-index:2;width:min(720px,92vw);margin-left:clamp(22px,6vw,86px);padding-top:36px}
+.eyebrow{font-size:13px;text-transform:uppercase;letter-spacing:.12em;color:var(--accent-2);font-weight:800}
+.copy h1{font-size:clamp(56px,8vw,120px);line-height:.92;margin:12px 0 22px;letter-spacing:0}
+.lead{font-size:clamp(18px,2vw,24px);line-height:1.5;color:var(--fg);opacity:.85;max-width:680px}
+.actions{display:flex;gap:12px;flex-wrap:wrap;margin-top:30px}
+.button,button{display:inline-flex;align-items:center;justify-content:center;min-height:42px;border:1px solid var(--accent);background:var(--accent);color:var(--bg);border-radius:var(--radius);padding:0 16px;font-weight:760;cursor:pointer;font:inherit}
+.button.secondary,.button.ghost{background:var(--panel);color:var(--fg);border-color:var(--border)}
+.band{background:var(--bg-2);color:var(--fg);padding:32px clamp(20px,5vw,64px) 64px}
+.grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:24px;max-width:1120px;margin:auto}
+.grid h2{font-size:20px;margin:0 0 8px}
+.grid p{margin:0;line-height:1.55;color:var(--muted)}
+.admin-body{background:var(--bg);color:var(--fg)}
+.topbar{display:flex;justify-content:space-between;align-items:center;padding:16px 24px;background:var(--bg-2);color:var(--fg);border-bottom:1px solid var(--border)}
+.topbar nav{position:static;padding:0;gap:16px}
+.topbar a{color:var(--muted)}
+.topbar .brand{color:var(--fg)}
+.topbar a:hover{color:var(--fg)}
+.admin{padding:24px;display:grid;gap:18px;max-width:960px}
+.admin-shell{display:grid;grid-template-columns:minmax(280px,320px) minmax(0,1fr);gap:24px;padding:24px;align-items:start}
+.sidebar{position:sticky;top:24px;display:grid;gap:16px}
+.sidebar-block{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);padding:18px;box-shadow:var(--shadow)}
+.sidebar-block h1{font-size:24px;margin:10px 0 0;overflow-wrap:anywhere}
+.sidebar-nav{display:grid;gap:8px}
+.sidebar-link{display:grid;gap:5px;padding:14px 16px;border:1px solid var(--border);border-radius:var(--radius);background:var(--panel);box-shadow:var(--shadow)}
+.sidebar-link strong{font-size:14px}
+.sidebar-link span{font-size:13px;line-height:1.45;color:var(--muted)}
+.sidebar-link.active{border-color:var(--accent);background:color-mix(in srgb,var(--accent) 10%,var(--panel))}
+.sidebar-link:hover{border-color:var(--border-2)}
+.status-stack{display:grid;gap:10px;margin-top:14px}
+.sidebar-note{font-size:13px;color:var(--muted)}
+.sidebar-summary{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+.sidebar-summary div{padding:12px;border:1px solid var(--border);border-radius:var(--radius);background:var(--bg-2)}
+.sidebar-summary span{display:block;color:var(--muted);font-size:12px}
+.sidebar-summary strong{display:block;margin-top:4px;font-size:18px;overflow-wrap:anywhere}
+.workspace{display:grid;gap:18px;min-width:0}
+.workspace-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px}
+.page-header{display:flex;align-items:end;justify-content:space-between;gap:16px}
+.page-header h2{font-size:32px;margin:8px 0 6px}
+.page-header p{margin:0}
+.panel{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);padding:20px;box-shadow:var(--shadow);min-width:0}
+.panel.wide{grid-column:1/-1}
+.panel h1{font-size:24px;margin:2px 0 0;color:var(--fg);overflow-wrap:anywhere}
+.panel h2,.panel h3{font-size:18px;margin:0 0 14px}
+.muted,.steps{color:var(--muted);line-height:1.5}
+.row-head{display:flex;justify-content:space-between;gap:12px;align-items:center}
+.endpoint{margin:0;font-size:30px;font-weight:760;line-height:1.1;overflow-wrap:anywhere}
+.metric-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin-top:16px}
+.metric{border:1px solid var(--border);border-radius:var(--radius);padding:12px;background:var(--bg-2)}
+.metric span{display:block;color:var(--muted);font-size:13px}
+.metric strong{display:block;font-size:22px;margin-top:4px;overflow-wrap:anywhere}
+.pill{display:inline-flex;border-radius:99px;padding:6px 10px;font-size:13px;font-weight:780}
+.pill.ok{background:color-mix(in srgb,var(--ok) 18%,var(--panel));color:var(--ok)}
+.pill.warn{background:color-mix(in srgb,var(--warn) 18%,var(--panel));color:var(--warn)}
+.provider-list{display:grid;gap:12px}
+.provider-form{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.3fr) auto auto auto;gap:10px;align-items:end;padding:12px;border:1px solid var(--border);border-radius:var(--radius);background:var(--bg-2)}
+.provider-form strong{display:block;font-size:15px}
+.provider-main{display:grid;gap:4px;align-self:start}
+.stack{display:grid;gap:12px}
+.stack label,.provider-form label{display:grid;gap:6px;font-weight:700}
+.stack input,.stack select,.inline-form input,.provider-form input,.mini-form input,.inline-form select{height:38px;border:1px solid var(--border);border-radius:6px;padding:0 10px;font:inherit;background:var(--bg);color:var(--fg);min-width:0}
+.check{display:flex!important;grid-template-columns:auto 1fr;align-items:center;gap:8px}
+.check input{height:auto}
+.inline-form{display:grid;grid-template-columns:repeat(4,minmax(0,1fr)) auto;gap:8px;margin-top:14px}
+.key-add{grid-template-columns:minmax(0,1fr) minmax(0,1fr) auto}
+.user-add{grid-template-columns:minmax(0,1.2fr) minmax(0,1fr) minmax(120px,.5fr) auto auto}
+.mini-form{display:flex;gap:8px;align-items:end}
+.mini-form label{display:grid;gap:5px;font-size:13px;font-weight:700}
+.key-box{white-space:pre-wrap;overflow-wrap:anywhere;background:var(--bg);color:var(--accent-2);border:1px solid var(--border);border-radius:var(--radius);padding:14px;font-size:15px}
+.detail-list{display:grid;gap:12px;margin:0}
+.detail-list.compact{gap:10px}
+.detail-list div{display:grid;gap:3px;padding:12px;border:1px solid var(--border);border-radius:var(--radius);background:var(--bg-2)}
+.detail-list dt{color:var(--muted);font-size:12px}
+.detail-list dd{margin:0;font-size:15px;overflow-wrap:anywhere}
+table{width:100%;border-collapse:collapse;font-size:14px}
+td,th{border-bottom:1px solid var(--border);padding:10px;text-align:left;vertical-align:top;overflow-wrap:anywhere}
+th{color:var(--muted)}
+.icon{min-height:30px;width:32px;padding:0;background:var(--panel);color:var(--danger);border-color:color-mix(in srgb,var(--danger) 30%,var(--border))}
+.theme-select{height:32px;padding:0 8px;border-radius:6px;border:1px solid var(--border);background:var(--panel);color:var(--fg);font:inherit;font-size:13px;cursor:pointer}
+@media(max-width:980px){
+  .admin-shell,.workspace-grid,.provider-form,.metric-grid{grid-template-columns:1fr}
+  .sidebar{position:static}
+  .sidebar-summary{grid-template-columns:repeat(4,minmax(0,1fr))}
+  .page-header,.row-head,.mini-form{display:grid}
+}
+@media(max-width:820px){
+  .grid,.sidebar-summary{grid-template-columns:1fr}
+  .copy h1{font-size:54px}
+  .inline-form,.key-add,.user-add{grid-template-columns:1fr}
+  .topbar{display:grid;gap:10px}
+  .hero{min-height:88vh}
+  .admin,.admin-shell{padding:18px}
+}
 "#
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AdminSection, admin_redirect_path};
+
+    #[test]
+    fn admin_sections_map_from_paths() {
+        assert_eq!(
+            AdminSection::from_path("/admin"),
+            Some(AdminSection::Overview)
+        );
+        assert_eq!(
+            AdminSection::from_path("/admin/providers"),
+            Some(AdminSection::Providers)
+        );
+        assert_eq!(AdminSection::from_path("/admin/unknown"), None);
+    }
+
+    #[test]
+    fn post_redirects_stay_on_related_section() {
+        assert_eq!(
+            admin_redirect_path("/admin/provider/save"),
+            "/admin/providers"
+        );
+        assert_eq!(admin_redirect_path("/admin/users/save"), "/admin/users");
+        assert_eq!(admin_redirect_path("/admin/models/sync"), "/admin/models");
+        assert_eq!(admin_redirect_path("/admin/other"), "/admin");
+    }
 }
