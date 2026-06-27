@@ -379,7 +379,7 @@ pub fn admin(req: &Request, stream: &mut TcpStream, cfg: &Config) {
 <html lang="en" data-theme="">
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><link rel="icon" href="/favicon.svg" type="image/svg+xml"><link rel="apple-touch-icon" href="/apple-touch-icon.png" sizes="180x180"><title>AkurAI Router Admin</title><script>{flash_js}</script><style>{themes}{css}</style></head>
 <body class="admin-body">
-<header class="topbar"><a class="brand" href="/"><img class="brand-icon" src="/favicon.svg" alt="">AkurAI<span class="brand-dim">/Router</span></a><nav><span>{email}</span><a href="/logout">Log out</a><span data-theme-picker></span></nav></header>
+<header class="topbar"><a class="brand" href="/"><img class="brand-icon" src="/favicon.svg" alt="">AkurAI<span class="brand-dim">/Router</span></a><nav><span class="topbar-email">{email}</span><a href="/logout">Log out</a><span data-theme-picker></span></nav></header>
 <main class="admin-shell">
   <aside class="sidebar">
     <div class="sidebar-block">
@@ -612,7 +612,7 @@ fn render_admin_users(
 <section class="workspace-grid">
   <article class="panel wide">
     <div class="row-head"><h3>IDP users and cost allocation</h3><form method="post" action="/admin/billing/save" class="mini-form"><label>Monthly shared cost USD<input name="monthly_shared_cost_usd" type="number" min="0" step="0.0001" value="{monthly_shared_cost}"></label><button>Save</button></form></div>
-    <table><thead><tr><th>Email</th><th>Name</th><th>Status</th><th>Share</th><th>Requests</th><th>Tokens</th><th>Direct cost</th><th>Allocated total</th></tr></thead><tbody>{user_rows}</tbody></table>
+    <div class="table-wrap"><table><thead><tr><th>Email</th><th>Name</th><th>Status</th><th>Share</th><th>Requests</th><th>Tokens</th><th>Direct cost</th><th>Allocated total</th></tr></thead><tbody>{user_rows}</tbody></table></div>
     <form method="post" action="/admin/users/save" class="inline-form user-add">
       <input name="email" placeholder="idp user email">
       <input name="name" placeholder="display name">
@@ -653,7 +653,7 @@ fn render_admin_keys(key_rows: &str, user_options: &str, active_keys: usize) -> 
 <section class="workspace-grid">
   <article class="panel wide">
     <div class="row-head"><h3>Assigned router keys</h3><span class="pill ok">{active_keys} active</span></div>
-    <table><thead><tr><th>ID</th><th>Owner</th><th>Name</th><th>Key</th><th>Status</th><th>Last used</th><th></th></tr></thead><tbody>{key_rows}</tbody></table>
+    <div class="table-wrap"><table><thead><tr><th>ID</th><th>Owner</th><th>Name</th><th>Key</th><th>Status</th><th>Last used</th><th></th></tr></thead><tbody>{key_rows}</tbody></table></div>
     <form method="post" action="/admin/keys/create" class="inline-form key-add">
       <select name="email">{user_options}</select>
       <input name="name" placeholder="key label">
@@ -684,7 +684,7 @@ fn render_admin_models(model_rows: &str, model_count: usize) -> String {
 <section class="workspace-grid">
   <article class="panel wide">
     <div class="row-head"><h3>Configured models</h3><form method="post" action="/admin/models/sync"><button>Sync provider catalogs</button></form></div>
-    <table><thead><tr><th>ID</th><th>Name</th><th>Upstream</th><th>Provider</th><th>Status</th><th></th></tr></thead><tbody>{model_rows}</tbody></table>
+    <div class="table-wrap"><table><thead><tr><th>ID</th><th>Name</th><th>Upstream</th><th>Provider</th><th>Status</th><th></th></tr></thead><tbody>{model_rows}</tbody></table></div>
     <form method="post" action="/admin/models/add" class="inline-form">
       <input name="id" placeholder="model id">
       <input name="name" placeholder="display name">
@@ -912,7 +912,7 @@ fn generated_key_page(
 <html lang="en" data-theme="">
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><link rel="icon" href="/favicon.svg" type="image/svg+xml"><link rel="apple-touch-icon" href="/apple-touch-icon.png" sizes="180x180"><title>AkurAI Router Key</title><script>{flash_js}</script><style>{themes}{css}</style></head>
 <body class="admin-body">
-<header class="topbar"><a class="brand" href="/"><img class="brand-icon" src="/favicon.svg" alt="">AkurAI<span class="brand-dim">/Router</span></a><nav><span>{email}</span><a href="/admin/keys">Keys</a><span data-theme-picker></span></nav></header>
+<header class="topbar"><a class="brand" href="/"><img class="brand-icon" src="/favicon.svg" alt="">AkurAI<span class="brand-dim">/Router</span></a><nav><span class="topbar-email">{email}</span><a href="/admin/keys">Keys</a><span data-theme-picker></span></nav></header>
 <main class="admin">
   <section class="panel wide">
     <p class="eyebrow">Router key created</p>
@@ -1079,8 +1079,8 @@ fn style() -> &'static str {
     r#"*{box-sizing:border-box}
 body{margin:0;font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:var(--bg);color:var(--fg)}
 a{color:inherit;text-decoration:none}
-nav{position:absolute;top:0;left:0;right:0;z-index:3;display:flex;align-items:center;justify-content:space-between;padding:22px clamp(20px,5vw,64px)}
-nav div{display:flex;gap:18px;align-items:center}
+.hero nav{position:absolute;top:0;left:0;right:0;z-index:3;display:flex;align-items:center;justify-content:space-between;gap:16px;padding:22px clamp(20px,5vw,64px)}
+.hero nav div{display:flex;gap:18px;align-items:center;flex-wrap:wrap;justify-content:flex-end}
 .brand{display:inline-flex;align-items:center;gap:9px;font-weight:760;letter-spacing:0}
 .brand-icon{width:30px;height:30px;border-radius:8px;box-shadow:0 8px 20px -10px rgba(0,0,0,.55);flex:none}
 .brand-dim{color:var(--muted);font-weight:660}
@@ -1100,12 +1100,13 @@ nav div{display:flex;gap:18px;align-items:center}
 .grid p{margin:0;line-height:1.55;color:var(--muted)}
 .admin-body{background:var(--bg);color:var(--fg)}
 .topbar{display:flex;justify-content:space-between;align-items:center;padding:16px 24px;background:var(--bg-2);color:var(--fg);border-bottom:1px solid var(--border)}
-.topbar nav{position:static;padding:0;gap:16px}
+.topbar nav{position:static;display:flex;align-items:center;justify-content:flex-end;flex-wrap:wrap;gap:12px;padding:0;min-width:0}
 .topbar a{color:var(--muted)}
 .topbar .brand{color:var(--fg)}
 .topbar a:hover{color:var(--fg)}
+.topbar-email{color:var(--muted);max-width:min(46vw,360px);overflow-wrap:anywhere;text-align:right}
 .admin{padding:24px;display:grid;gap:18px;max-width:960px}
-.admin-shell{display:grid;grid-template-columns:minmax(280px,320px) minmax(0,1fr);gap:24px;padding:24px;align-items:start}
+.admin-shell{display:grid;grid-template-columns:minmax(248px,300px) minmax(0,1fr);gap:24px;padding:24px clamp(18px,3vw,32px) 40px;align-items:start;max-width:1440px;margin:0 auto}
 .sidebar{position:sticky;top:24px;display:grid;gap:16px}
 .sidebar-block{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);padding:18px;box-shadow:var(--shadow)}
 .sidebar-block h1{font-size:24px;margin:10px 0 0;overflow-wrap:anywhere}
@@ -1122,8 +1123,9 @@ nav div{display:flex;gap:18px;align-items:center}
 .sidebar-summary span{display:block;color:var(--muted);font-size:12px}
 .sidebar-summary strong{display:block;margin-top:4px;font-size:18px;overflow-wrap:anywhere}
 .workspace{display:grid;gap:18px;min-width:0}
-.workspace-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px}
+.workspace-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px;align-items:start}
 .page-header{display:flex;align-items:end;justify-content:space-between;gap:16px}
+.page-header>div{min-width:0}
 .page-header h2{font-size:32px;margin:8px 0 6px}
 .page-header p{margin:0}
 .panel{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);padding:20px;box-shadow:var(--shadow);min-width:0}
@@ -1131,7 +1133,8 @@ nav div{display:flex;gap:18px;align-items:center}
 .panel h1{font-size:24px;margin:2px 0 0;color:var(--fg);overflow-wrap:anywhere}
 .panel h2,.panel h3{font-size:18px;margin:0 0 14px}
 .muted,.steps{color:var(--muted);line-height:1.5}
-.row-head{display:flex;justify-content:space-between;gap:12px;align-items:center}
+.row-head{display:flex;justify-content:space-between;gap:12px;align-items:flex-start;flex-wrap:wrap}
+.row-head>*{min-width:0}
 .endpoint{margin:0;font-size:30px;font-weight:760;line-height:1.1;overflow-wrap:anywhere}
 .metric-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin-top:16px}
 .metric{border:1px solid var(--border);border-radius:var(--radius);padding:12px;background:var(--bg-2)}
@@ -1142,6 +1145,7 @@ nav div{display:flex;gap:18px;align-items:center}
 .pill.warn{background:color-mix(in srgb,var(--warn) 18%,var(--panel));color:var(--warn)}
 .provider-list{display:grid;gap:12px}
 .provider-form{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.3fr) auto auto auto;gap:10px;align-items:end;padding:12px;border:1px solid var(--border);border-radius:var(--radius);background:var(--bg-2)}
+.provider-form>*{min-width:0}
 .provider-form strong{display:block;font-size:15px}
 .provider-main{display:grid;gap:4px;align-self:start}
 .stack{display:grid;gap:12px}
@@ -1149,10 +1153,10 @@ nav div{display:flex;gap:18px;align-items:center}
 .stack input,.stack select,.inline-form input,.provider-form input,.mini-form input,.inline-form select{height:38px;border:1px solid var(--border);border-radius:6px;padding:0 10px;font:inherit;background:var(--bg);color:var(--fg);min-width:0}
 .check{display:flex!important;grid-template-columns:auto 1fr;align-items:center;gap:8px}
 .check input{height:auto}
-.inline-form{display:grid;grid-template-columns:repeat(4,minmax(0,1fr)) auto;gap:8px;margin-top:14px}
+.inline-form{display:grid;grid-template-columns:repeat(4,minmax(0,1fr)) auto;gap:8px;align-items:end;margin-top:14px}
 .key-add{grid-template-columns:minmax(0,1fr) minmax(0,1fr) auto}
 .user-add{grid-template-columns:minmax(0,1.2fr) minmax(0,1fr) minmax(120px,.5fr) auto auto}
-.mini-form{display:flex;gap:8px;align-items:end}
+.mini-form{display:flex;gap:8px;align-items:end;flex-wrap:wrap}
 .mini-form label{display:grid;gap:5px;font-size:13px;font-weight:700}
 .key-box{white-space:pre-wrap;overflow-wrap:anywhere;background:var(--bg);color:var(--accent-2);border:1px solid var(--border);border-radius:var(--radius);padding:14px;font-size:15px}
 .detail-list{display:grid;gap:12px;margin:0}
@@ -1160,22 +1164,34 @@ nav div{display:flex;gap:18px;align-items:center}
 .detail-list div{display:grid;gap:3px;padding:12px;border:1px solid var(--border);border-radius:var(--radius);background:var(--bg-2)}
 .detail-list dt{color:var(--muted);font-size:12px}
 .detail-list dd{margin:0;font-size:15px;overflow-wrap:anywhere}
-table{width:100%;border-collapse:collapse;font-size:14px}
+button{max-width:100%;white-space:normal;text-align:center}
+.table-wrap{max-width:100%;overflow-x:auto}
+table{width:100%;min-width:640px;border-collapse:collapse;font-size:14px}
 td,th{border-bottom:1px solid var(--border);padding:10px;text-align:left;vertical-align:top;overflow-wrap:anywhere}
 th{color:var(--muted)}
 .icon{min-height:30px;width:32px;padding:0;background:var(--panel);color:var(--danger);border-color:color-mix(in srgb,var(--danger) 30%,var(--border))}
 .theme-select{height:32px;padding:0 8px;border-radius:6px;border:1px solid var(--border);background:var(--panel);color:var(--fg);font:inherit;font-size:13px;cursor:pointer}
-@media(max-width:980px){
-  .admin-shell,.workspace-grid,.provider-form,.metric-grid{grid-template-columns:1fr}
+@media(max-width:1180px){
+  .admin-shell,.workspace-grid{grid-template-columns:1fr}
   .sidebar{position:static}
   .sidebar-summary{grid-template-columns:repeat(4,minmax(0,1fr))}
-  .page-header,.row-head,.mini-form{display:grid}
+  .provider-form{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .provider-main{grid-column:1/-1}
+  .inline-form,.user-add{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .key-add{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}
+  .page-header,.row-head{display:grid}
+  .mini-form{display:grid;grid-template-columns:minmax(0,1fr) auto}
+}
+@media(max-width:980px){
+  .metric-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .sidebar-summary{grid-template-columns:repeat(2,minmax(0,1fr))}
 }
 @media(max-width:820px){
-  .grid,.sidebar-summary{grid-template-columns:1fr}
+  .grid,.sidebar-summary,.inline-form,.key-add,.user-add,.provider-form,.mini-form,.metric-grid{grid-template-columns:1fr}
   .copy h1{font-size:54px}
-  .inline-form,.key-add,.user-add{grid-template-columns:1fr}
   .topbar{display:grid;gap:10px}
+  .topbar nav{justify-content:flex-start}
+  .topbar-email{max-width:100%;text-align:left}
   .hero{min-height:88vh}
   .admin,.admin-shell{padding:18px}
 }
