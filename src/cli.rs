@@ -60,6 +60,16 @@ fn dispatch(req: Request, stream: &mut std::net::TcpStream, cfg: &Config) {
         ("GET", "/health") => {
             let _ = http::send_json(stream, 200, "{\"ok\":true,\"service\":\"akurai-router\"}");
         }
+        ("GET", "/api/health") => {
+            let _ = http::send_json(
+                stream,
+                200,
+                &format!(
+                    "{{\"app\":\"akurai-router\",\"version\":\"{}\",\"status\":\"ok\"}}",
+                    env!("CARGO_PKG_VERSION")
+                ),
+            );
+        }
         ("GET", "/login") => oauth::login(&req, stream, cfg),
         ("GET", "/auth/callback") => oauth::callback(&req, stream, cfg),
         ("GET", "/logout") => landing::logout(&req, stream, cfg),
