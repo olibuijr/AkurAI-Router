@@ -2,3 +2,6 @@
 /.akurai-router/
 *.env
 !.env.example
+
+# Agent worktree + harness artifacts (never commit)
+.claude/
