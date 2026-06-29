@@ -27,6 +27,12 @@ pub struct Config {
     pub opencode_go_chat_url: String,
     pub opencode_go_messages_url: String,
     pub opencode_go_models_url: String,
+    /// OpenCode Go API keys for the load-balanced pool. Round-robin while all are
+    /// healthy; a key that returns out-of-quota is cooled down and skipped until it
+    /// recovers. Empty falls back to the single key in `opencode_go_auth_path`.
+    pub opencode_go_keys: Vec<String>,
+    /// How long (seconds) a key stays out of rotation after an out-of-quota response.
+    pub opencode_go_cooldown_secs: u64,
     pub default_model: String,
     pub idp_issuer: String,
     pub idp_client_id: String,
@@ -127,6 +133,10 @@ impl Config {
                 "AKURAI_ROUTER_OPENCODE_GO_MODELS_URL",
                 "https://opencode.ai/zen/go/v1/models",
             ),
+            opencode_go_keys: split_keys(&get("AKURAI_ROUTER_OPENCODE_GO_KEYS", "")),
+            opencode_go_cooldown_secs: get("AKURAI_ROUTER_OPENCODE_GO_COOLDOWN_SECS", "300")
+                .parse()
+                .unwrap_or(300),
             default_model: get("AKURAI_ROUTER_DEFAULT_MODEL", "gpt-5.4-mini"),
             idp_issuer: get("AKURAI_ROUTER_IDP_ISSUER", "https://auth.olibuijr.com")
                 .trim_end_matches('/')
@@ -492,7 +502,7 @@ pub fn infer_model_provider_id(model_id: &str) -> String {
         return PROVIDER_EMBEDDINGS.to_string();
     }
     if let Some((provider_id, _)) = split_model_provider_prefix(model_id) {
-        return provider_id;
+        provider_id
     } else if model_id.starts_with("claude-") {
         PROVIDER_CLAUDE.to_string()
     } else if is_opencode_go_model(model_id) {
@@ -538,10 +548,10 @@ pub fn split_model_provider_prefix(model_id: &str) -> Option<(String, String)> {
 }
 
 pub fn model_id_for_provider(model_id: &str, provider_id: &str) -> String {
-    if let Some((prefix_provider, bare_model)) = split_model_provider_prefix(model_id) {
-        if prefix_provider == canonical_provider_id(provider_id) {
-            return bare_model;
-        }
+    if let Some((prefix_provider, bare_model)) = split_model_provider_prefix(model_id)
+        && prefix_provider == canonical_provider_id(provider_id)
+    {
+        return bare_model;
     }
     model_id.to_string()
 }
@@ -574,6 +584,19 @@ pub fn is_opencode_go_model(model_id: &str) -> bool {
         .any(|model| model.id == bare)
 }
 
+/// Split a comma / whitespace / newline-separated key list into a deduped,
+/// order-preserving Vec. Used for the OpenCode Go load-balanced key pool.
+fn split_keys(raw: &str) -> Vec<String> {
+    let mut keys: Vec<String> = Vec::new();
+    for part in raw.split([',', '\n', '\r', ' ', '\t']) {
+        let key = part.trim();
+        if !key.is_empty() && !keys.iter().any(|k| k == key) {
+            keys.push(key.to_string());
+        }
+    }
+    keys
+}
+
 fn read_kv(path: &PathBuf) -> Vec<(String, String)> {
     let Ok(text) = fs::read_to_string(path) else {
         return Vec::new();
@@ -602,5 +625,27 @@ fn config_bool(value: &str, default: bool) -> bool {
         "1" | "true" | "yes" | "on" | "enabled" => true,
         "0" | "false" | "no" | "off" | "disabled" => false,
         _ => default,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split_keys;
+
+    #[test]
+    fn split_keys_dedupes_and_trims() {
+        let keys = split_keys(" sk-aaa, sk-bbb ,sk-aaa\n sk-ccc\t");
+        assert_eq!(keys, vec!["sk-aaa", "sk-bbb", "sk-ccc"]);
+    }
+
+    #[test]
+    fn split_keys_empty_is_empty() {
+        assert!(split_keys("").is_empty());
+        assert!(split_keys("  ,  \n ").is_empty());
+    }
+
+    #[test]
+    fn split_keys_single() {
+        assert_eq!(split_keys("sk-only"), vec!["sk-only"]);
     }
 }

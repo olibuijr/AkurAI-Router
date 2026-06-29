@@ -1,3 +1,7 @@
+#![allow(clippy::question_mark)]
+#![allow(clippy::too_many_arguments)]
+#![allow(clippy::format_in_format_args)]
+
 mod accounts;
 mod auth;
 mod cli;

@@ -455,6 +455,8 @@ mod tests {
             opencode_go_chat_url: "https://example.com/opencode-chat".to_string(),
             opencode_go_messages_url: "https://example.com/opencode-messages".to_string(),
             opencode_go_models_url: "https://example.com/opencode-models".to_string(),
+            opencode_go_keys: Vec::new(),
+            opencode_go_cooldown_secs: 300,
             default_model: "gpt-5.4-mini".to_string(),
             idp_issuer: "https://auth.example.com".to_string(),
             idp_client_id: "client".to_string(),

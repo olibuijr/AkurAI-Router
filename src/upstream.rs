@@ -3,7 +3,9 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::{Child, ChildStdout, Command, Stdio};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use crate::accounts::{self, UsageRecord};
 use crate::auth::ApiActor;
@@ -45,6 +47,166 @@ struct ClaudeAuth {
 #[derive(Clone, Debug)]
 struct OpenCodeGoAuth {
     api_key: String,
+}
+
+// ── OpenCode Go load-balanced key pool ──────────────────────────────────────
+//
+// Round-robin across all configured keys while they are healthy. When a key
+// returns an out-of-quota response (401/402/403/429), it is parked for a
+// cooldown window and skipped; requests keep flowing on the working key(s).
+// Once the cooldown expires the key re-enters rotation automatically.
+
+struct OpenCodeGoPool {
+    cursor: usize,
+    /// (key, cooldown-expiry) for keys currently parked as out-of-quota.
+    downs: Vec<(String, Instant)>,
+}
+
+static OPENCODE_GO_POOL: Mutex<OpenCodeGoPool> = Mutex::new(OpenCodeGoPool {
+    cursor: 0,
+    downs: Vec::new(),
+});
+
+/// Statuses that mean "this key is out of quota / not usable right now" — the
+/// trigger to park the key and fail over to the next one.
+fn opencode_go_status_means_down(status: u16) -> bool {
+    matches!(status, 401 | 402 | 403 | 429)
+}
+
+/// Round-robin pick over keys not currently cooling down. If every key is parked,
+/// fall back to plain round-robin (least-bad) so a request still gets attempted.
+fn select_opencode_go_key(keys: &[String]) -> usize {
+    let mut pool = OPENCODE_GO_POOL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let now = Instant::now();
+    pool.downs.retain(|(_, until)| *until > now);
+    let n = keys.len();
+    for _ in 0..n {
+        let idx = pool.cursor % n;
+        pool.cursor = pool.cursor.wrapping_add(1);
+        if !pool.downs.iter().any(|(k, _)| k == &keys[idx]) {
+            return idx;
+        }
+    }
+    let idx = pool.cursor % n;
+    pool.cursor = pool.cursor.wrapping_add(1);
+    idx
+}
+
+/// Park a key as out-of-quota for `cooldown`. Replaces any existing entry.
+fn mark_opencode_go_key_down(key: &str, cooldown: Duration) {
+    let mut pool = OPENCODE_GO_POOL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let until = Instant::now() + cooldown;
+    pool.downs.retain(|(k, _)| k != key);
+    pool.downs.push((key.to_string(), until));
+}
+
+/// The active key pool: env-configured keys if present, else the single key from
+/// the opencode auth file (backward compatible).
+fn load_opencode_go_keys(cfg: &Config) -> Result<Vec<String>, String> {
+    if !cfg.opencode_go_keys.is_empty() {
+        return Ok(cfg.opencode_go_keys.clone());
+    }
+    let auth = load_opencode_go_auth(cfg)?;
+    Ok(vec![auth.api_key])
+}
+
+enum DispatchOutcome {
+    /// Streaming response already written to the client; carries the upstream status.
+    Streamed(u16),
+    /// Non-streaming response captured; caller delivers/transforms `body`.
+    Captured(u16, String),
+    /// Every key failed (all out of quota, or a hard error). `body` is ready JSON.
+    Failed(u16, String),
+}
+
+/// Run a request against the OpenCode Go key pool with round-robin + failover.
+/// `build_headers` produces the per-key headers (the auth header differs between
+/// the chat and messages endpoints). Streaming responses are forwarded only once
+/// an acceptable upstream status is seen, so failover never half-streams.
+fn opencode_go_dispatch<F>(
+    cfg: &Config,
+    url: &str,
+    streaming: bool,
+    build_headers: F,
+    body: &[u8],
+    stream: &mut TcpStream,
+) -> DispatchOutcome
+where
+    F: Fn(&str) -> Vec<(String, String)>,
+{
+    let keys = match load_opencode_go_keys(cfg) {
+        Ok(keys) if !keys.is_empty() => keys,
+        Ok(_) => {
+            return DispatchOutcome::Failed(
+                502,
+                error_json("no opencode-go keys configured (set AKURAI_ROUTER_OPENCODE_GO_KEYS)"),
+            );
+        }
+        Err(e) => return DispatchOutcome::Failed(502, error_json(&e)),
+    };
+    let n = keys.len();
+    let cooldown = Duration::from_secs(cfg.opencode_go_cooldown_secs.max(1));
+    let mut last_status = 502u16;
+    let mut last_body = error_json("opencode-go request failed");
+
+    for _ in 0..n {
+        let idx = select_opencode_go_key(&keys);
+        let key = keys[idx].clone();
+        let headers = build_headers(&key);
+
+        if streaming {
+            match curl_stream_begin(url, &headers, body) {
+                Ok(begin) => {
+                    if n > 1 && opencode_go_status_means_down(begin.status) {
+                        last_status = begin.status;
+                        last_body = drain_stream_begin(begin);
+                        mark_opencode_go_key_down(&key, cooldown);
+                        continue;
+                    }
+                    let begin_status = begin.status;
+                    return match curl_stream_finish(begin, stream) {
+                        Ok(status) => DispatchOutcome::Streamed(status),
+                        // Headers already reached the client — can't fail over now.
+                        Err(_) => DispatchOutcome::Streamed(begin_status),
+                    };
+                }
+                Err(e) => {
+                    last_status = 502;
+                    last_body = error_json(&e);
+                    mark_opencode_go_key_down(&key, cooldown);
+                    continue;
+                }
+            }
+        } else {
+            let headers_ref: Vec<(&str, String)> = headers
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.clone()))
+                .collect();
+            match curl_capture("POST", url, &headers_ref, body, 900) {
+                Ok(resp) => {
+                    let text = String::from_utf8_lossy(&resp.body).to_string();
+                    if n > 1 && opencode_go_status_means_down(resp.status) {
+                        last_status = resp.status;
+                        last_body = text;
+                        mark_opencode_go_key_down(&key, cooldown);
+                        continue;
+                    }
+                    return DispatchOutcome::Captured(resp.status, text);
+                }
+                Err(e) => {
+                    last_status = 502;
+                    last_body = error_json(&e);
+                    mark_opencode_go_key_down(&key, cooldown);
+                    continue;
+                }
+            }
+        }
+    }
+    DispatchOutcome::Failed(last_status, last_body)
 }
 
 pub fn models_json(cfg: &Config) -> String {
@@ -380,35 +542,51 @@ fn forward_opencode_go(
 
     let mut body = input;
     body.set("model", Json::String(upstream_model));
-    let auth = match load_opencode_go_auth(cfg) {
-        Ok(a) => a,
-        Err(e) => {
-            let _ = http::send_json(stream, 502, &error_json(&e));
-            return;
-        }
-    };
-    let accept = if body.get_bool("stream").unwrap_or(false) {
+    let streaming = body.get_bool("stream").unwrap_or(false);
+    let accept = if streaming {
         "text/event-stream"
     } else {
         "application/json"
     };
-    let headers = vec![
-        ("Content-Type".to_string(), "application/json".to_string()),
-        ("Accept".to_string(), accept.to_string()),
-        (
-            "Authorization".to_string(),
-            format!("Bearer {}", auth.api_key),
-        ),
-    ];
     let body_text = body.stringify();
-    if body.get_bool("stream").unwrap_or(false) {
-        match curl_stream_post(
-            &cfg.opencode_go_chat_url,
-            &headers,
-            body_text.as_bytes(),
-            stream,
-        ) {
-            Ok(status) => record_usage(
+    let outcome = opencode_go_dispatch(
+        cfg,
+        &cfg.opencode_go_chat_url,
+        streaming,
+        |key| {
+            vec![
+                ("Content-Type".to_string(), "application/json".to_string()),
+                ("Accept".to_string(), accept.to_string()),
+                ("Authorization".to_string(), format!("Bearer {key}")),
+            ]
+        },
+        body_text.as_bytes(),
+        stream,
+    );
+    match outcome {
+        DispatchOutcome::Streamed(status) => record_usage(
+            cfg,
+            actor,
+            PROVIDER_OPENCODE_GO,
+            &requested_model,
+            &req.path,
+            status,
+            None,
+        ),
+        DispatchOutcome::Captured(status, text) => {
+            record_usage(
+                cfg,
+                actor,
+                PROVIDER_OPENCODE_GO,
+                &requested_model,
+                &req.path,
+                status,
+                Some(&text),
+            );
+            let _ = http::send_json(stream, status, &text);
+        }
+        DispatchOutcome::Failed(status, body) => {
+            record_usage(
                 cfg,
                 actor,
                 PROVIDER_OPENCODE_GO,
@@ -416,57 +594,8 @@ fn forward_opencode_go(
                 &req.path,
                 status,
                 None,
-            ),
-            Err(e) => {
-                record_usage(
-                    cfg,
-                    actor,
-                    PROVIDER_OPENCODE_GO,
-                    &requested_model,
-                    &req.path,
-                    502,
-                    None,
-                );
-                let _ = http::send_json(stream, 502, &error_json(&e));
-            }
-        }
-    } else {
-        let headers_ref: Vec<(&str, String)> = headers
-            .iter()
-            .map(|(k, v)| (k.as_str(), v.clone()))
-            .collect();
-        match curl_capture(
-            "POST",
-            &cfg.opencode_go_chat_url,
-            &headers_ref,
-            body_text.as_bytes(),
-            900,
-        ) {
-            Ok(resp) => {
-                let text = String::from_utf8_lossy(&resp.body);
-                record_usage(
-                    cfg,
-                    actor,
-                    PROVIDER_OPENCODE_GO,
-                    &requested_model,
-                    &req.path,
-                    resp.status,
-                    Some(&text),
-                );
-                let _ = http::send_json(stream, resp.status, &text);
-            }
-            Err(e) => {
-                record_usage(
-                    cfg,
-                    actor,
-                    PROVIDER_OPENCODE_GO,
-                    &requested_model,
-                    &req.path,
-                    502,
-                    None,
-                );
-                let _ = http::send_json(stream, 502, &error_json(&e));
-            }
+            );
+            let _ = http::send_json(stream, status, &body);
         }
     }
 }
@@ -491,43 +620,34 @@ fn forward_opencode_go_messages(
         }
     };
 
-    let auth = match load_opencode_go_auth(cfg) {
-        Ok(a) => a,
-        Err(e) => {
-            let _ = http::send_json(stream, 502, &error_json(&e));
-            return;
-        }
-    };
-    let headers = vec![
-        ("Content-Type", "application/json".to_string()),
-        ("Accept", "application/json".to_string()),
-        ("x-api-key", auth.api_key),
-        ("anthropic-version", "2023-06-01".to_string()),
-    ];
-    match curl_capture(
-        "POST",
+    let outcome = opencode_go_dispatch(
+        cfg,
         &cfg.opencode_go_messages_url,
-        &headers,
+        false,
+        |key| {
+            vec![
+                ("Content-Type".to_string(), "application/json".to_string()),
+                ("Accept".to_string(), "application/json".to_string()),
+                ("x-api-key".to_string(), key.to_string()),
+                ("anthropic-version".to_string(), "2023-06-01".to_string()),
+            ]
+        },
         body.as_bytes(),
-        900,
-    ) {
-        Ok(resp) => {
-            let text = String::from_utf8_lossy(&resp.body);
+        stream,
+    );
+    match outcome {
+        DispatchOutcome::Captured(status, text) => {
             record_usage(
                 cfg,
                 actor,
                 PROVIDER_OPENCODE_GO,
                 &requested_model,
                 &req.path,
-                resp.status,
+                status,
                 Some(&text),
             );
-            if resp.status != 200 {
-                let _ = http::send_json(
-                    stream,
-                    resp.status,
-                    &error_json(&String::from_utf8_lossy(&resp.body)),
-                );
+            if status != 200 {
+                let _ = http::send_json(stream, status, &error_json(&text));
                 return;
             }
             match claude_to_openai_response(&text, cfg) {
@@ -539,18 +659,20 @@ fn forward_opencode_go_messages(
                 }
             }
         }
-        Err(e) => {
+        DispatchOutcome::Failed(status, body) => {
             record_usage(
                 cfg,
                 actor,
                 PROVIDER_OPENCODE_GO,
                 &requested_model,
                 &req.path,
-                502,
+                status,
                 None,
             );
-            let _ = http::send_json(stream, 502, &error_json(&e));
+            let _ = http::send_json(stream, status, &body);
         }
+        // Messages endpoint never streams (dispatch called with streaming=false).
+        DispatchOutcome::Streamed(_) => {}
     }
 }
 
@@ -683,10 +805,10 @@ pub fn curl_capture(
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("failed to spawn curl: {e}"))?;
-    if method != "GET" {
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(body).map_err(|e| e.to_string())?;
-        }
+    if method != "GET"
+        && let Some(mut stdin) = child.stdin.take()
+    {
+        stdin.write_all(body).map_err(|e| e.to_string())?;
     }
     let out = child.wait_with_output().map_err(|e| e.to_string())?;
     if !out.status.success() {
@@ -698,12 +820,25 @@ pub fn curl_capture(
     parse_curl_output(&out.stdout)
 }
 
-fn curl_stream_post(
+/// An in-flight streaming upstream request whose status line + headers have been
+/// read but whose body has NOT yet been forwarded to the client. This lets the
+/// caller inspect `status` and fail over to another key before any byte reaches
+/// the client (`finish` to forward, `drain` to discard).
+struct StreamBegin {
+    child: Child,
+    stdout: ChildStdout,
+    status: u16,
+    response_headers: Vec<(String, String)>,
+    body_prefix: Vec<u8>,
+}
+
+/// Spawn the upstream request and read up to the end of the response headers.
+/// Nothing is written to the client yet.
+fn curl_stream_begin(
     url: &str,
     headers: &[(String, String)],
     body: &[u8],
-    stream: &mut TcpStream,
-) -> Result<u16, String> {
+) -> Result<StreamBegin, String> {
     let mut cmd = Command::new("curl");
     cmd.arg("--silent")
         .arg("--show-error")
@@ -760,10 +895,30 @@ fn curl_stream_post(
         }
     };
 
+    Ok(StreamBegin {
+        child,
+        stdout,
+        status,
+        response_headers,
+        body_prefix,
+    })
+}
+
+/// Forward a `StreamBegin` to the client: headers, the already-read body prefix,
+/// then pump the rest of the body until upstream closes.
+fn curl_stream_finish(begin: StreamBegin, stream: &mut TcpStream) -> Result<u16, String> {
+    let StreamBegin {
+        mut child,
+        mut stdout,
+        status,
+        response_headers,
+        body_prefix,
+    } = begin;
     http::stream_headers(stream, status, &response_headers).map_err(|e| e.to_string())?;
     if !body_prefix.is_empty() {
         stream.write_all(&body_prefix).map_err(|e| e.to_string())?;
     }
+    let mut tmp = [0u8; 8192];
     loop {
         let n = stdout.read(&mut tmp).map_err(|e| e.to_string())?;
         if n == 0 {
@@ -774,6 +929,43 @@ fn curl_stream_post(
     }
     let _ = child.wait();
     Ok(status)
+}
+
+/// Discard a `StreamBegin` (an out-of-quota response we're failing over from),
+/// returning its body as a ready-to-send JSON string for the error path.
+fn drain_stream_begin(begin: StreamBegin) -> String {
+    let StreamBegin {
+        mut child,
+        mut stdout,
+        body_prefix,
+        ..
+    } = begin;
+    let mut body = body_prefix;
+    let mut tmp = [0u8; 8192];
+    while body.len() < 64 * 1024 {
+        match stdout.read(&mut tmp) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => body.extend_from_slice(&tmp[..n]),
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    let text = String::from_utf8_lossy(&body).trim().to_string();
+    if text.starts_with('{') {
+        text
+    } else {
+        error_json(&text)
+    }
+}
+
+fn curl_stream_post(
+    url: &str,
+    headers: &[(String, String)],
+    body: &[u8],
+    stream: &mut TcpStream,
+) -> Result<u16, String> {
+    let begin = curl_stream_begin(url, headers, body)?;
+    curl_stream_finish(begin, stream)
 }
 
 fn transform_request(path: &str, raw: &[u8], cfg: &Config) -> Result<String, String> {
@@ -850,10 +1042,10 @@ fn chat_content_to_parts(content: Option<&Json>) -> Vec<Json> {
                     if let Some(image) = input_image_part(part) {
                         parts.push(image);
                     }
-                } else if let Some(text) = part.get_str("text") {
-                    if !text.is_empty() {
-                        parts.push(input_text_part(text));
-                    }
+                } else if let Some(text) = part.get_str("text")
+                    && !text.is_empty()
+                {
+                    parts.push(input_text_part(text));
                 }
             }
         }
@@ -1135,20 +1327,23 @@ fn claude_billing_block(raw: &[u8]) -> Json {
 // and report "Stream ended without finish_reason".
 fn chat_completion_to_sse(completion: &str) -> Result<String, String> {
     let parsed = json::parse(completion)?;
-    let id = parsed.get_str("id").unwrap_or("chatcmpl-akurai").to_string();
+    let id = parsed
+        .get_str("id")
+        .unwrap_or("chatcmpl-akurai")
+        .to_string();
     let model = parsed.get_str("model").unwrap_or("").to_string();
     let created =
         json_number_string(parsed.get("created")).unwrap_or_else(|| now_secs().to_string());
     let mut content = String::new();
     let mut finish = "stop".to_string();
-    if let Some(Json::Array(choices)) = parsed.get("choices") {
-        if let Some(choice) = choices.first() {
-            if let Some(text) = choice.get("message").and_then(|m| m.get_str("content")) {
-                content = text.to_string();
-            }
-            if let Some(fr) = choice.get_str("finish_reason") {
-                finish = fr.to_string();
-            }
+    if let Some(Json::Array(choices)) = parsed.get("choices")
+        && let Some(choice) = choices.first()
+    {
+        if let Some(text) = choice.get("message").and_then(|m| m.get_str("content")) {
+            content = text.to_string();
+        }
+        if let Some(fr) = choice.get_str("finish_reason") {
+            finish = fr.to_string();
         }
     }
     let chunk = |delta: Json, finish_reason: Json| -> String {
@@ -1237,10 +1432,10 @@ fn claude_to_openai_response(raw: &str, cfg: &Config) -> Result<String, String> 
     }
     let prompt_tokens = json_number_string(usage.get("prompt_tokens"));
     let completion_tokens = json_number_string(usage.get("completion_tokens"));
-    if let (Some(p), Some(c)) = (prompt_tokens, completion_tokens) {
-        if let (Ok(pn), Ok(cn)) = (p.parse::<u64>(), c.parse::<u64>()) {
-            usage.set("total_tokens", Json::Number((pn + cn).to_string()));
-        }
+    if let (Some(p), Some(c)) = (prompt_tokens, completion_tokens)
+        && let (Ok(pn), Ok(cn)) = (p.parse::<u64>(), c.parse::<u64>())
+    {
+        usage.set("total_tokens", Json::Number((pn + cn).to_string()));
     }
     root.set("usage", usage);
     Ok(root.stringify())
@@ -1365,10 +1560,9 @@ fn normalize_input(body: &mut Json) {
         for item in items {
             if let Json::Object(fields) = item {
                 if let Some((_, Json::String(role))) = fields.iter_mut().find(|(k, _)| k == "role")
+                    && role == "system"
                 {
-                    if role == "system" {
-                        *role = "developer".to_string();
-                    }
+                    *role = "developer".to_string();
                 }
                 fields.retain(|(k, v)| {
                     !(k == "id" && matches!(v, Json::String(s) if is_server_id(s)))
@@ -1438,10 +1632,10 @@ fn request_provider_id(req: &http::Request, cfg: &Config) -> String {
 
 fn request_model(req: &http::Request, cfg: &Config) -> String {
     let raw = String::from_utf8_lossy(&req.body);
-    if let Ok(root) = json::parse(&raw) {
-        if let Some(model) = root.get_str("model") {
-            return model.to_string();
-        }
+    if let Ok(root) = json::parse(&raw)
+        && let Some(model) = root.get_str("model")
+    {
+        return model.to_string();
     }
     cfg.default_model.clone()
 }
@@ -1582,23 +1776,23 @@ fn extract_opencode_go_auth(root: &Json) -> Result<OpenCodeGoAuth, String> {
     for provider_id in [PROVIDER_OPENCODE_GO, "opencode"] {
         if let Some(provider) = root.get(provider_id) {
             for key_name in ["key", "apiKey", "api_key", "accessToken", "access_token"] {
-                if let Some(key) = provider.get_str(key_name) {
-                    if !key.trim().is_empty() {
-                        return Ok(OpenCodeGoAuth {
-                            api_key: key.trim().to_string(),
-                        });
-                    }
+                if let Some(key) = provider.get_str(key_name)
+                    && !key.trim().is_empty()
+                {
+                    return Ok(OpenCodeGoAuth {
+                        api_key: key.trim().to_string(),
+                    });
                 }
             }
         }
     }
     for key_name in ["apiKey", "api_key", "key"] {
-        if let Some(key) = root.get_str(key_name) {
-            if !key.trim().is_empty() {
-                return Ok(OpenCodeGoAuth {
-                    api_key: key.trim().to_string(),
-                });
-            }
+        if let Some(key) = root.get_str(key_name)
+            && !key.trim().is_empty()
+        {
+            return Ok(OpenCodeGoAuth {
+                api_key: key.trim().to_string(),
+            });
         }
     }
     Err("OpenCode auth missing opencode-go.key; run `opencode auth login` or configure an API key file".to_string())
@@ -1744,6 +1938,8 @@ mod tests {
             opencode_go_chat_url: "https://example.com/opencode-chat".to_string(),
             opencode_go_messages_url: "https://example.com/opencode-messages".to_string(),
             opencode_go_models_url: "https://example.com/opencode-models".to_string(),
+            opencode_go_keys: Vec::new(),
+            opencode_go_cooldown_secs: 300,
             default_model: "gpt-5.4-mini".to_string(),
             idp_issuer: "https://auth.example.com".to_string(),
             idp_client_id: "client".to_string(),
@@ -1886,5 +2082,52 @@ mod tests {
         .unwrap();
         let parsed = json::parse(&opencode).unwrap();
         assert_eq!(parsed.get_str("model"), Some("qwen3.7-plus"));
+    }
+
+    #[test]
+    fn opencode_go_down_statuses() {
+        for s in [401, 402, 403, 429] {
+            assert!(opencode_go_status_means_down(s), "{s} should be down");
+        }
+        for s in [200, 400, 404, 408, 500, 503] {
+            assert!(!opencode_go_status_means_down(s), "{s} should not be down");
+        }
+    }
+
+    #[test]
+    fn pool_round_robins_when_all_healthy() {
+        // Unique key names so other tests' cooldowns don't interfere via the global pool.
+        let keys = vec!["rr_alpha_xyz".to_string(), "rr_beta_xyz".to_string()];
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..6 {
+            seen.insert(select_opencode_go_key(&keys));
+        }
+        // Both keys are exercised over several picks → load balanced.
+        assert!(seen.contains(&0) && seen.contains(&1));
+    }
+
+    #[test]
+    fn pool_skips_key_in_cooldown() {
+        let keys = vec!["cd_alpha_qaz".to_string(), "cd_beta_qaz".to_string()];
+        // Park key 0 for a long window; every pick must land on key 1.
+        mark_opencode_go_key_down(&keys[0], Duration::from_secs(3600));
+        for _ in 0..5 {
+            assert_eq!(select_opencode_go_key(&keys), 1);
+        }
+    }
+
+    #[test]
+    fn pool_recovers_after_cooldown_expires() {
+        let keys = vec!["rec_alpha_plm".to_string(), "rec_beta_plm".to_string()];
+        // A cooldown of zero is effectively already expired → key re-enters rotation.
+        mark_opencode_go_key_down(&keys[0], Duration::from_secs(0));
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..6 {
+            seen.insert(select_opencode_go_key(&keys));
+        }
+        assert!(
+            seen.contains(&0),
+            "key should recover once cooldown expires"
+        );
     }
 }

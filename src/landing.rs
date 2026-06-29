@@ -831,20 +831,20 @@ pub fn admin_post(req: &Request, stream: &mut TcpStream, cfg: &Config) {
             }
         }
         "/admin/models/sync" => {
-            if let Ok(resp) = upstream::fetch_codex_models(cfg) {
-                if resp.status == 200 {
-                    merge_remote_models(cfg, &String::from_utf8_lossy(&resp.body), "codex");
-                }
+            if let Ok(resp) = upstream::fetch_codex_models(cfg)
+                && resp.status == 200
+            {
+                merge_remote_models(cfg, &String::from_utf8_lossy(&resp.body), "codex");
             }
-            if let Ok(resp) = upstream::fetch_claude_models(cfg) {
-                if resp.status == 200 {
-                    merge_remote_models(cfg, &String::from_utf8_lossy(&resp.body), "claude");
-                }
+            if let Ok(resp) = upstream::fetch_claude_models(cfg)
+                && resp.status == 200
+            {
+                merge_remote_models(cfg, &String::from_utf8_lossy(&resp.body), "claude");
             }
-            if let Ok(resp) = upstream::fetch_opencode_go_models(cfg) {
-                if resp.status == 200 {
-                    merge_remote_models(cfg, &String::from_utf8_lossy(&resp.body), "opencode-go");
-                }
+            if let Ok(resp) = upstream::fetch_opencode_go_models(cfg)
+                && resp.status == 200
+            {
+                merge_remote_models(cfg, &String::from_utf8_lossy(&resp.body), "opencode-go");
             }
         }
         "/admin/embeddings/save" => {
