@@ -386,6 +386,10 @@ pub fn forward_codex(req: &http::Request, stream: &mut TcpStream, cfg: &Config, 
 }
 
 fn forward_claude(req: &http::Request, stream: &mut TcpStream, cfg: &Config, actor: &ApiActor) {
+    if is_responses_path(&req.path) {
+        forward_claude_responses(req, stream, cfg, actor);
+        return;
+    }
     let requested_model = request_model(req, cfg);
     // The Claude upstream is queried non-streamed, but clients (pi) request stream:true
     // and parse an SSE response. Track that so we can synthesize a stream on the way back.
@@ -414,38 +418,7 @@ fn forward_claude(req: &http::Request, stream: &mut TcpStream, cfg: &Config, act
         .or_else(|| req.header("session_id"))
         .unwrap_or("akurai-router")
         .to_string();
-    let headers = vec![
-        ("Content-Type".to_string(), "application/json".to_string()),
-        ("Accept".to_string(), "application/json".to_string()),
-        (
-            "Authorization".to_string(),
-            format!("Bearer {}", auth.access_token),
-        ),
-        (
-            "Anthropic-Version".to_string(),
-            "2023-06-01".to_string(),
-        ),
-        (
-            "Anthropic-Beta".to_string(),
-            "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05,advanced-tool-use-2025-11-20,effort-2025-11-24,structured-outputs-2025-12-15,fast-mode-2026-02-01,redact-thinking-2026-02-12,token-efficient-tools-2026-03-28".to_string(),
-        ),
-        (
-            "Anthropic-Dangerous-Direct-Browser-Access".to_string(),
-            "true".to_string(),
-        ),
-        ("User-Agent".to_string(), "claude-cli/2.1.92 (external, sdk-cli)".to_string()),
-        ("X-App".to_string(), "cli".to_string()),
-        ("X-Stainless-Helper-Method".to_string(), "stream".to_string()),
-        ("X-Stainless-Retry-Count".to_string(), "0".to_string()),
-        ("X-Stainless-Runtime-Version".to_string(), "v24.14.0".to_string()),
-        ("X-Stainless-Package-Version".to_string(), "0.80.0".to_string()),
-        ("X-Stainless-Runtime".to_string(), "node".to_string()),
-        ("X-Stainless-Lang".to_string(), "js".to_string()),
-        ("X-Stainless-Arch".to_string(), runtime_arch().to_string()),
-        ("X-Stainless-Os".to_string(), runtime_os().to_string()),
-        ("X-Stainless-Timeout".to_string(), "600".to_string()),
-        ("X-Session-Id".to_string(), session_id),
-    ];
+    let headers = claude_request_headers(&auth.access_token, &session_id);
     let headers_ref: Vec<(&str, String)> = headers
         .iter()
         .map(|(k, v)| (k.as_str(), v.clone()))
@@ -512,17 +485,674 @@ fn forward_claude(req: &http::Request, stream: &mut TcpStream, cfg: &Config, act
     }
 }
 
+/// True when the request targets the OpenAI Responses API rather than
+/// chat/completions. codex speaks this natively; for every other provider the
+/// router translates Responses <-> chat/completions (see the `*_responses`
+/// handlers below).
+fn is_responses_path(path: &str) -> bool {
+    path.ends_with("/responses") || path == "/codex"
+}
+
+/// The full Claude/Anthropic header set. Extracted so both the chat path and the
+/// Responses bridge send identical upstream headers.
+fn claude_request_headers(access_token: &str, session_id: &str) -> Vec<(String, String)> {
+    vec![
+        ("Content-Type".to_string(), "application/json".to_string()),
+        ("Accept".to_string(), "application/json".to_string()),
+        (
+            "Authorization".to_string(),
+            format!("Bearer {access_token}"),
+        ),
+        ("Anthropic-Version".to_string(), "2023-06-01".to_string()),
+        (
+            "Anthropic-Beta".to_string(),
+            "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05,advanced-tool-use-2025-11-20,effort-2025-11-24,structured-outputs-2025-12-15,fast-mode-2026-02-01,redact-thinking-2026-02-12,token-efficient-tools-2026-03-28".to_string(),
+        ),
+        (
+            "Anthropic-Dangerous-Direct-Browser-Access".to_string(),
+            "true".to_string(),
+        ),
+        (
+            "User-Agent".to_string(),
+            "claude-cli/2.1.92 (external, sdk-cli)".to_string(),
+        ),
+        ("X-App".to_string(), "cli".to_string()),
+        ("X-Stainless-Helper-Method".to_string(), "stream".to_string()),
+        ("X-Stainless-Retry-Count".to_string(), "0".to_string()),
+        ("X-Stainless-Runtime-Version".to_string(), "v24.14.0".to_string()),
+        ("X-Stainless-Package-Version".to_string(), "0.80.0".to_string()),
+        ("X-Stainless-Runtime".to_string(), "node".to_string()),
+        ("X-Stainless-Lang".to_string(), "js".to_string()),
+        ("X-Stainless-Arch".to_string(), runtime_arch().to_string()),
+        ("X-Stainless-Os".to_string(), runtime_os().to_string()),
+        ("X-Stainless-Timeout".to_string(), "600".to_string()),
+        ("X-Session-Id".to_string(), session_id.to_string()),
+    ]
+}
+
+/// Flatten Responses-API `content` (array of `input_text`/`output_text`/`text`
+/// parts, or a bare string) into a single chat-completions text string.
+fn responses_content_to_text(content: Option<&Json>) -> String {
+    match content {
+        Some(Json::String(s)) => s.clone(),
+        Some(Json::Array(parts)) => parts
+            .iter()
+            .filter_map(|p| p.get_str("text").map(|t| t.to_string()))
+            .collect::<Vec<_>>()
+            .join(""),
+        _ => String::new(),
+    }
+}
+
+/// Convert Responses-API tool definitions (`{type,name,parameters,description}`)
+/// into chat-completions tool definitions (`{type:function,function:{...}}`).
+/// Already-nested chat-style tools are passed through unchanged.
+fn responses_tools_to_chat(tools: &[Json]) -> Vec<Json> {
+    let mut out = Vec::new();
+    for tool in tools {
+        if tool.get("function").is_some() {
+            out.push(tool.clone());
+            continue;
+        }
+        let mut function = Json::object();
+        if let Some(name) = tool.get_str("name") {
+            function.set("name", Json::String(name.to_string()));
+        }
+        if let Some(desc) = tool.get_str("description") {
+            function.set("description", Json::String(desc.to_string()));
+        }
+        if let Some(params) = tool.get("parameters") {
+            function.set("parameters", params.clone());
+        }
+        if let Some(Json::Bool(strict)) = tool.get("strict") {
+            function.set("strict", Json::Bool(*strict));
+        }
+        let mut wrapped = Json::object();
+        wrapped.set("type", Json::String("function".to_string()));
+        wrapped.set("function", function);
+        out.push(wrapped);
+    }
+    out
+}
+
+/// Translate an OpenAI Responses request into an equivalent chat/completions
+/// request. When `force_tool_for_schema` is set and the request asks for a
+/// `json_schema` structured output, the schema is bridged to a forced
+/// function-call (providers like DeepSeek reject `response_format: json_schema`
+/// but support tool calling). Returns the chat body plus, if the tool bridge was
+/// used, the synthetic tool name so the response can be converted back.
+fn responses_to_chat(
+    value: &Json,
+    default_model: &str,
+    force_tool_for_schema: bool,
+) -> Result<(Json, Option<String>), String> {
+    let mut out = Json::object();
+    out.set(
+        "model",
+        Json::String(value.get_str("model").unwrap_or(default_model).to_string()),
+    );
+
+    let mut messages = Vec::new();
+    if let Some(instructions) = value.get_str("instructions")
+        && !instructions.is_empty()
+    {
+        let mut sys = Json::object();
+        sys.set("role", Json::String("system".to_string()));
+        sys.set("content", Json::String(instructions.to_string()));
+        messages.push(sys);
+    }
+    match value.get("input") {
+        Some(Json::String(s)) => {
+            let mut m = Json::object();
+            m.set("role", Json::String("user".to_string()));
+            m.set("content", Json::String(s.clone()));
+            messages.push(m);
+        }
+        Some(Json::Array(items)) => {
+            for item in items {
+                let kind = item.get_str("type").unwrap_or("message");
+                match kind {
+                    "function_call_output" => {
+                        let mut m = Json::object();
+                        m.set("role", Json::String("tool".to_string()));
+                        if let Some(id) = item.get_str("call_id") {
+                            m.set("tool_call_id", Json::String(id.to_string()));
+                        }
+                        m.set(
+                            "content",
+                            Json::String(item.get_str("output").unwrap_or("").to_string()),
+                        );
+                        messages.push(m);
+                    }
+                    "function_call" => {
+                        let mut call = Json::object();
+                        call.set("id", Json::String(item.get_str("call_id").unwrap_or("").to_string()));
+                        call.set("type", Json::String("function".to_string()));
+                        let mut func = Json::object();
+                        func.set("name", Json::String(item.get_str("name").unwrap_or("").to_string()));
+                        func.set(
+                            "arguments",
+                            Json::String(item.get_str("arguments").unwrap_or("{}").to_string()),
+                        );
+                        call.set("function", func);
+                        let mut m = Json::object();
+                        m.set("role", Json::String("assistant".to_string()));
+                        m.set("content", Json::Null);
+                        m.set("tool_calls", Json::Array(vec![call]));
+                        messages.push(m);
+                    }
+                    _ => {
+                        let mut m = Json::object();
+                        m.set(
+                            "role",
+                            Json::String(item.get_str("role").unwrap_or("user").to_string()),
+                        );
+                        m.set(
+                            "content",
+                            Json::String(responses_content_to_text(item.get("content"))),
+                        );
+                        messages.push(m);
+                    }
+                }
+            }
+        }
+        _ => return Err("responses request requires `input`".to_string()),
+    }
+    if messages.is_empty() {
+        return Err("responses request produced no messages".to_string());
+    }
+
+    if let Some(s) = value.get_bool("stream") {
+        out.set("stream", Json::Bool(s));
+    }
+    if let Some(v) = value.get("temperature") {
+        out.set("temperature", v.clone());
+    }
+    if let Some(v) = value.get("top_p") {
+        out.set("top_p", v.clone());
+    }
+    if let Some(v) = value.get("reasoning_effort") {
+        out.set("reasoning_effort", v.clone());
+    }
+    if let Some(v) = value.get("max_output_tokens") {
+        out.set("max_tokens", v.clone());
+    }
+
+    let tools: Vec<Json> = match value.get("tools") {
+        Some(Json::Array(t)) => responses_tools_to_chat(t),
+        _ => Vec::new(),
+    };
+    if let Some(v) = value.get("tool_choice") {
+        out.set("tool_choice", v.clone());
+    }
+
+    // text.format -> structured output.
+    //
+    // `bridge_schema_via_prompt` providers (DeepSeek/GLM via opencode-go) reject
+    // `response_format: json_schema`, and reasoning models among them also reject a
+    // forced `tool_choice`. The portable path that works for both thinking and
+    // non-thinking models is `response_format: json_object` plus the schema injected
+    // into the prompt — the model returns the JSON as ordinary content. Other
+    // providers (Claude) keep the native `json_schema` response_format.
+    let structured_tool = None;
+    if let Some(format) = value.get("text").and_then(|t| t.get("format")) {
+        match format.get_str("type") {
+            Some("json_schema") => {
+                let schema = format.get("schema").cloned().unwrap_or_else(Json::object);
+                if force_tool_for_schema {
+                    let mut rf = Json::object();
+                    rf.set("type", Json::String("json_object".to_string()));
+                    out.set("response_format", rf);
+                    let mut sys = Json::object();
+                    sys.set("role", Json::String("system".to_string()));
+                    sys.set(
+                        "content",
+                        Json::String(format!(
+                            "You must respond with a single valid JSON object that strictly conforms to this JSON Schema. Output only the JSON object, with no surrounding prose or markdown fences.\nJSON Schema:\n{}",
+                            schema.stringify()
+                        )),
+                    );
+                    messages.push(sys);
+                } else {
+                    let name = format.get_str("name").unwrap_or("structured_output").to_string();
+                    let strict = format.get_bool("strict").unwrap_or(true);
+                    let mut rf = Json::object();
+                    rf.set("type", Json::String("json_schema".to_string()));
+                    let mut js = Json::object();
+                    js.set("name", Json::String(name));
+                    js.set("schema", schema);
+                    js.set("strict", Json::Bool(strict));
+                    rf.set("json_schema", js);
+                    out.set("response_format", rf);
+                }
+            }
+            Some("json_object") => {
+                let mut rf = Json::object();
+                rf.set("type", Json::String("json_object".to_string()));
+                out.set("response_format", rf);
+            }
+            _ => {}
+        }
+    }
+    if !tools.is_empty() {
+        out.set("tools", Json::Array(tools));
+    }
+
+    out.set("messages", Json::Array(messages));
+    Ok((out, structured_tool))
+}
+
+/// Convert a chat/completions response object into an OpenAI Responses object.
+/// When `structured_tool` is set, the forced tool call's arguments are surfaced
+/// as the assistant's output text (the round-trip for the json_schema bridge).
+fn chat_completion_to_responses(chat: &Json, structured_tool: Option<&str>) -> Json {
+    let model = chat.get_str("model").unwrap_or("").to_string();
+    let id = format!("resp_{}", now_secs());
+    let msg_id = format!("msg_{}", now_secs());
+
+    let mut output = Vec::new();
+    let mut aggregated_text = String::new();
+
+    let message = chat
+        .get("choices")
+        .and_then(|c| match c {
+            Json::Array(a) => a.first(),
+            _ => None,
+        })
+        .and_then(|choice| choice.get("message"));
+
+    // Structured-output bridge: pull the forced tool call's JSON arguments out as
+    // plain output text so SDKs that read `output_text` get the structured JSON.
+    if let Some(name) = structured_tool
+        && let Some(args) = message
+            .and_then(|m| m.get("tool_calls"))
+            .and_then(|tc| match tc {
+                Json::Array(a) => a.first(),
+                _ => None,
+            })
+            .filter(|call| {
+                call.get("function")
+                    .and_then(|f| f.get_str("name"))
+                    .map(|n| n == name)
+                    .unwrap_or(true)
+            })
+            .and_then(|call| call.get("function"))
+            .and_then(|f| f.get_str("arguments"))
+    {
+        aggregated_text = args.to_string();
+    } else {
+        // Plain text content.
+        if let Some(text) = message.and_then(|m| m.get_str("content")) {
+            aggregated_text = text.to_string();
+        }
+        // Emit any genuine tool calls as function_call items.
+        if let Some(Json::Array(calls)) = message.and_then(|m| m.get("tool_calls")) {
+            for call in calls {
+                let func = call.get("function");
+                let mut item = Json::object();
+                item.set("type", Json::String("function_call".to_string()));
+                item.set("id", Json::String(call.get_str("id").unwrap_or("").to_string()));
+                item.set("call_id", Json::String(call.get_str("id").unwrap_or("").to_string()));
+                item.set(
+                    "name",
+                    Json::String(func.and_then(|f| f.get_str("name")).unwrap_or("").to_string()),
+                );
+                item.set(
+                    "arguments",
+                    Json::String(
+                        func.and_then(|f| f.get_str("arguments")).unwrap_or("{}").to_string(),
+                    ),
+                );
+                item.set("status", Json::String("completed".to_string()));
+                output.push(item);
+            }
+        }
+    }
+
+    if !aggregated_text.is_empty() || output.is_empty() {
+        let mut part = Json::object();
+        part.set("type", Json::String("output_text".to_string()));
+        part.set("text", Json::String(aggregated_text.clone()));
+        part.set("annotations", Json::Array(Vec::new()));
+        let mut msg = Json::object();
+        msg.set("type", Json::String("message".to_string()));
+        msg.set("id", Json::String(msg_id));
+        msg.set("status", Json::String("completed".to_string()));
+        msg.set("role", Json::String("assistant".to_string()));
+        msg.set("content", Json::Array(vec![part]));
+        output.insert(0, msg);
+    }
+
+    let mut resp = Json::object();
+    resp.set("id", Json::String(id));
+    resp.set("object", Json::String("response".to_string()));
+    resp.set("created_at", Json::Number(now_secs().to_string()));
+    resp.set("model", Json::String(model));
+    resp.set("status", Json::String("completed".to_string()));
+    resp.set("output", Json::Array(output));
+    resp.set("output_text", Json::String(aggregated_text));
+
+    let mut usage = Json::object();
+    if let Some(u) = chat.get("usage") {
+        if let Some(p) = json_number_string(u.get("prompt_tokens")) {
+            usage.set("input_tokens", Json::Number(p));
+        }
+        if let Some(c) = json_number_string(u.get("completion_tokens")) {
+            usage.set("output_tokens", Json::Number(c));
+        }
+        if let Some(t) = json_number_string(u.get("total_tokens")) {
+            usage.set("total_tokens", Json::Number(t));
+        }
+    }
+    resp.set("usage", usage);
+    resp
+}
+
+/// Aggregate the `output_text` from a Responses object.
+fn responses_output_text(resp: &Json) -> String {
+    resp.get_str("output_text").unwrap_or("").to_string()
+}
+
+/// Synthesize the documented Responses streaming event sequence for a single
+/// completed text message. Used when a client requests `stream:true` against a
+/// provider the router queries non-streamed.
+fn responses_object_to_sse(resp: &Json) -> String {
+    let text = responses_output_text(resp);
+    let msg_id = resp
+        .get("output")
+        .and_then(|o| match o {
+            Json::Array(a) => a.first(),
+            _ => None,
+        })
+        .and_then(|m| m.get_str("id"))
+        .unwrap_or("msg_0")
+        .to_string();
+
+    let mut initial = resp.clone();
+    initial.set("status", Json::String("in_progress".to_string()));
+    initial.set("output", Json::Array(Vec::new()));
+
+    let mut seq = 0u64;
+    let mut out = String::new();
+    let mut emit = |event: &str, data: Json, seq: &mut u64| {
+        let mut d = data;
+        d.set("type", Json::String(event.to_string()));
+        d.set("sequence_number", Json::Number(seq.to_string()));
+        out.push_str(&format!("event: {event}\ndata: {}\n\n", d.stringify()));
+        *seq += 1;
+    };
+
+    let mut created = Json::object();
+    created.set("response", initial.clone());
+    emit("response.created", created, &mut seq);
+
+    let mut in_prog = Json::object();
+    in_prog.set("response", initial);
+    emit("response.in_progress", in_prog, &mut seq);
+
+    let mut item = Json::object();
+    item.set("type", Json::String("message".to_string()));
+    item.set("id", Json::String(msg_id.clone()));
+    item.set("status", Json::String("in_progress".to_string()));
+    item.set("role", Json::String("assistant".to_string()));
+    item.set("content", Json::Array(Vec::new()));
+    let mut added = Json::object();
+    added.set("output_index", Json::Number("0".to_string()));
+    added.set("item", item);
+    emit("response.output_item.added", added, &mut seq);
+
+    let mut part = Json::object();
+    part.set("type", Json::String("output_text".to_string()));
+    part.set("text", Json::String(String::new()));
+    part.set("annotations", Json::Array(Vec::new()));
+    let mut part_added = Json::object();
+    part_added.set("item_id", Json::String(msg_id.clone()));
+    part_added.set("output_index", Json::Number("0".to_string()));
+    part_added.set("content_index", Json::Number("0".to_string()));
+    part_added.set("part", part);
+    emit("response.content_part.added", part_added, &mut seq);
+
+    let mut delta = Json::object();
+    delta.set("item_id", Json::String(msg_id.clone()));
+    delta.set("output_index", Json::Number("0".to_string()));
+    delta.set("content_index", Json::Number("0".to_string()));
+    delta.set("delta", Json::String(text.clone()));
+    emit("response.output_text.delta", delta, &mut seq);
+
+    let mut done = Json::object();
+    done.set("item_id", Json::String(msg_id.clone()));
+    done.set("output_index", Json::Number("0".to_string()));
+    done.set("content_index", Json::Number("0".to_string()));
+    done.set("text", Json::String(text.clone()));
+    emit("response.output_text.done", done, &mut seq);
+
+    let mut completed = Json::object();
+    completed.set("response", resp.clone());
+    emit("response.completed", completed, &mut seq);
+
+    out
+}
+
+/// OpenAI Responses API bridge for opencode-go (DeepSeek/GLM/etc). Translates the
+/// request to chat/completions (bridging json_schema -> forced tool call so
+/// structured output works on DeepSeek), queries the upstream non-streamed, then
+/// converts the result back into a Responses object (or synthesized SSE).
+fn forward_opencode_go_responses(
+    req: &http::Request,
+    stream: &mut TcpStream,
+    cfg: &Config,
+    actor: &ApiActor,
+) {
+    let value = match json::parse(&String::from_utf8_lossy(&req.body)) {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = http::send_json(stream, 400, &error_json(&e));
+            return;
+        }
+    };
+    let wants_stream = value.get_bool("stream").unwrap_or(false);
+    let requested_model = value
+        .get_str("model")
+        .unwrap_or(&cfg.default_model)
+        .to_string();
+    let upstream_model = resolve_model_id_for_provider(cfg, &requested_model, PROVIDER_OPENCODE_GO);
+    if is_opencode_go_messages_model(&upstream_model) {
+        let _ = http::send_json(
+            stream,
+            400,
+            &error_json("this opencode-go model does not support /v1/responses; use /v1/chat/completions"),
+        );
+        return;
+    }
+
+    let (mut chat, structured_tool) = match responses_to_chat(&value, &cfg.default_model, true) {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = http::send_json(stream, 400, &error_json(&e));
+            return;
+        }
+    };
+    chat.set("model", Json::String(upstream_model));
+    chat.set("stream", Json::Bool(false));
+    let body_text = chat.stringify();
+
+    let outcome = opencode_go_dispatch(
+        cfg,
+        &cfg.opencode_go_chat_url,
+        false,
+        |key| {
+            vec![
+                ("Content-Type".to_string(), "application/json".to_string()),
+                ("Accept".to_string(), "application/json".to_string()),
+                ("Authorization".to_string(), format!("Bearer {key}")),
+            ]
+        },
+        body_text.as_bytes(),
+        stream,
+    );
+    match outcome {
+        DispatchOutcome::Captured(status, text) => {
+            record_usage(
+                cfg,
+                actor,
+                PROVIDER_OPENCODE_GO,
+                &requested_model,
+                &req.path,
+                status,
+                Some(&text),
+            );
+            if status != 200 {
+                let _ = http::send_json(stream, status, &text);
+                return;
+            }
+            let chat_json = match json::parse(&text) {
+                Ok(v) => v,
+                Err(e) => {
+                    let _ = http::send_json(stream, 502, &error_json(&e));
+                    return;
+                }
+            };
+            let resp = chat_completion_to_responses(&chat_json, structured_tool.as_deref());
+            if wants_stream {
+                let _ = http::send_text(stream, 200, "text/event-stream", &responses_object_to_sse(&resp));
+            } else {
+                let _ = http::send_json(stream, 200, &resp.stringify());
+            }
+        }
+        DispatchOutcome::Failed(status, body) => {
+            record_usage(
+                cfg,
+                actor,
+                PROVIDER_OPENCODE_GO,
+                &requested_model,
+                &req.path,
+                status,
+                None,
+            );
+            let _ = http::send_json(stream, status, &body);
+        }
+        DispatchOutcome::Streamed(_) => {}
+    }
+}
+
+/// OpenAI Responses API bridge for the Claude provider. Translates the request to
+/// chat/completions, runs the existing Claude pipeline, then converts the
+/// chat-completion result into a Responses object (or synthesized SSE).
+fn forward_claude_responses(
+    req: &http::Request,
+    stream: &mut TcpStream,
+    cfg: &Config,
+    actor: &ApiActor,
+) {
+    let value = match json::parse(&String::from_utf8_lossy(&req.body)) {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = http::send_json(stream, 400, &error_json(&e));
+            return;
+        }
+    };
+    let wants_stream = value.get_bool("stream").unwrap_or(false);
+    let requested_model = value
+        .get_str("model")
+        .unwrap_or(&cfg.default_model)
+        .to_string();
+    // Claude structured outputs are not surfaced through our text-only converter,
+    // so keep json_schema as response_format (best-effort) rather than tool-bridging.
+    let (mut chat, _structured) = match responses_to_chat(&value, &cfg.default_model, false) {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = http::send_json(stream, 400, &error_json(&e));
+            return;
+        }
+    };
+    chat.set("stream", Json::Bool(false));
+
+    let body = match transform_claude_request(chat.stringify().as_bytes(), cfg) {
+        Ok(body) => body,
+        Err(e) => {
+            let _ = http::send_json(stream, 400, &error_json(&e));
+            return;
+        }
+    };
+    let auth = match load_or_refresh_claude_auth(cfg) {
+        Ok(a) => a,
+        Err(e) => {
+            let _ = http::send_json(stream, 502, &error_json(&e));
+            return;
+        }
+    };
+    let session_id = req
+        .header("x-session-id")
+        .or_else(|| req.header("session_id"))
+        .unwrap_or("akurai-router")
+        .to_string();
+    let headers = claude_request_headers(&auth.access_token, &session_id);
+    let headers_ref: Vec<(&str, String)> = headers
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.clone()))
+        .collect();
+    match curl_capture("POST", &cfg.claude_messages_url, &headers_ref, body.as_bytes(), 900) {
+        Ok(resp) => {
+            let text = String::from_utf8_lossy(&resp.body);
+            record_usage(
+                cfg,
+                actor,
+                PROVIDER_CLAUDE,
+                &requested_model,
+                &req.path,
+                resp.status,
+                Some(&text),
+            );
+            if resp.status != 200 {
+                let _ = http::send_json(stream, resp.status, &error_json(&text));
+                return;
+            }
+            match claude_to_openai_response(&text, cfg) {
+                Ok(chat_completion) => match json::parse(&chat_completion) {
+                    Ok(chat_json) => {
+                        let resp_obj = chat_completion_to_responses(&chat_json, None);
+                        if wants_stream {
+                            let _ = http::send_text(
+                                stream,
+                                200,
+                                "text/event-stream",
+                                &responses_object_to_sse(&resp_obj),
+                            );
+                        } else {
+                            let _ = http::send_json(stream, 200, &resp_obj.stringify());
+                        }
+                    }
+                    Err(e) => {
+                        let _ = http::send_json(stream, 502, &error_json(&e));
+                    }
+                },
+                Err(e) => {
+                    let _ = http::send_json(stream, 502, &error_json(&e));
+                }
+            }
+        }
+        Err(e) => {
+            record_usage(cfg, actor, PROVIDER_CLAUDE, &requested_model, &req.path, 502, None);
+            let _ = http::send_json(stream, 502, &error_json(&e));
+        }
+    }
+}
+
 fn forward_opencode_go(
     req: &http::Request,
     stream: &mut TcpStream,
     cfg: &Config,
     actor: &ApiActor,
 ) {
+    if is_responses_path(&req.path) {
+        forward_opencode_go_responses(req, stream, cfg, actor);
+        return;
+    }
     if !req.path.ends_with("/chat/completions") {
         let _ = http::send_json(
             stream,
             400,
-            &error_json("opencode-go models support /v1/chat/completions"),
+            &error_json("opencode-go models support /v1/chat/completions or /v1/responses"),
         );
         return;
     }
@@ -2129,5 +2759,127 @@ mod tests {
             seen.contains(&0),
             "key should recover once cooldown expires"
         );
+    }
+
+    #[test]
+    fn responses_string_input_becomes_user_message() {
+        let req = json::parse(r#"{"model":"deepseek-v4-flash","input":"hello"}"#).unwrap();
+        let (chat, tool) = responses_to_chat(&req, "default", true).unwrap();
+        assert!(tool.is_none());
+        let Some(Json::Array(messages)) = chat.get("messages") else {
+            panic!("expected messages array");
+        };
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].get_str("role"), Some("user"));
+        assert_eq!(messages[0].get_str("content"), Some("hello"));
+    }
+
+    #[test]
+    fn responses_instructions_and_array_input() {
+        let req = json::parse(
+            r#"{"model":"m","instructions":"be terse","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}"#,
+        )
+        .unwrap();
+        let (chat, _) = responses_to_chat(&req, "default", true).unwrap();
+        let Some(Json::Array(messages)) = chat.get("messages") else {
+            panic!("expected messages");
+        };
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].get_str("role"), Some("system"));
+        assert_eq!(messages[0].get_str("content"), Some("be terse"));
+        assert_eq!(messages[1].get_str("content"), Some("hi"));
+    }
+
+    #[test]
+    fn json_schema_bridges_to_json_object_plus_prompt() {
+        let req = json::parse(
+            r#"{"model":"deepseek-v4-flash","input":"x","text":{"format":{"type":"json_schema","name":"person","strict":true,"schema":{"type":"object","properties":{"a":{"type":"string"}}}}}}"#,
+        )
+        .unwrap();
+        let (chat, tool) = responses_to_chat(&req, "default", true).unwrap();
+        // Thinking models reject forced tool_choice, so no tool bridge.
+        assert!(tool.is_none());
+        assert!(chat.get("tools").is_none());
+        assert!(chat.get("tool_choice").is_none());
+        // json_object is used (DeepSeek rejects json_schema response_format).
+        let rf = chat.get("response_format").expect("response_format set");
+        assert_eq!(rf.get_str("type"), Some("json_object"));
+        // The schema is injected into a system message so the model conforms.
+        let Some(Json::Array(messages)) = chat.get("messages") else {
+            panic!("expected messages");
+        };
+        let last = messages.last().unwrap();
+        assert_eq!(last.get_str("role"), Some("system"));
+        assert!(last.get_str("content").unwrap().contains("JSON Schema"));
+    }
+
+    #[test]
+    fn json_schema_passthrough_when_not_bridged() {
+        let req = json::parse(
+            r#"{"model":"m","input":"x","text":{"format":{"type":"json_schema","name":"r","schema":{"type":"object"}}}}"#,
+        )
+        .unwrap();
+        let (chat, tool) = responses_to_chat(&req, "default", false).unwrap();
+        assert!(tool.is_none());
+        let rf = chat.get("response_format").expect("response_format set");
+        assert_eq!(rf.get_str("type"), Some("json_schema"));
+    }
+
+    #[test]
+    fn tool_call_result_becomes_output_text() {
+        let chat = json::parse(
+            r#"{"model":"deepseek-v4-flash","choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"person","arguments":"{\"a\":\"b\"}"}}]}}],"usage":{"prompt_tokens":5,"completion_tokens":3,"total_tokens":8}}"#,
+        )
+        .unwrap();
+        let resp = chat_completion_to_responses(&chat, Some("person"));
+        assert_eq!(resp.get_str("object"), Some("response"));
+        assert_eq!(resp.get_str("status"), Some("completed"));
+        assert_eq!(resp.get_str("output_text"), Some(r#"{"a":"b"}"#));
+        assert_eq!(
+            resp.get("usage").and_then(|u| u.get_str("input_tokens")).or_else(|| resp
+                .get("usage")
+                .and_then(|u| match u.get("input_tokens") {
+                    Some(Json::Number(n)) => Some(n.as_str()),
+                    _ => None,
+                })),
+            Some("5")
+        );
+    }
+
+    #[test]
+    fn plain_chat_content_becomes_output_message() {
+        let chat = json::parse(
+            r#"{"model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"hi there"}}]}"#,
+        )
+        .unwrap();
+        let resp = chat_completion_to_responses(&chat, None);
+        assert_eq!(resp.get_str("output_text"), Some("hi there"));
+        let Some(Json::Array(output)) = resp.get("output") else {
+            panic!("expected output array");
+        };
+        assert_eq!(output[0].get_str("type"), Some("message"));
+    }
+
+    #[test]
+    fn responses_sse_emits_full_event_sequence() {
+        let chat = json::parse(
+            r#"{"model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"hello"}}]}"#,
+        )
+        .unwrap();
+        let resp = chat_completion_to_responses(&chat, None);
+        let sse = responses_object_to_sse(&resp);
+        assert!(sse.contains("event: response.created"));
+        assert!(sse.contains("event: response.output_text.delta"));
+        assert!(sse.contains("event: response.completed"));
+        assert!(sse.contains("\"delta\":\"hello\""));
+    }
+
+    #[test]
+    fn is_responses_path_matches_variants() {
+        assert!(is_responses_path("/v1/responses"));
+        assert!(is_responses_path("/api/v1/responses"));
+        assert!(is_responses_path("/responses"));
+        assert!(is_responses_path("/codex"));
+        assert!(!is_responses_path("/v1/chat/completions"));
     }
 }
