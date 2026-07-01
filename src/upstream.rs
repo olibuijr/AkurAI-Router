@@ -360,7 +360,18 @@ pub fn forward_codex(req: &http::Request, stream: &mut TcpStream, cfg: &Config, 
         headers.push(("chatgpt-account-id".to_string(), auth.account_id));
     }
 
-    match curl_stream_post(&cfg.codex_responses_url, &headers, body.as_bytes(), stream) {
+    let result = if req.path.ends_with("/chat/completions") {
+        curl_stream_post_responses_as_chat(
+            &cfg.codex_responses_url,
+            &headers,
+            body.as_bytes(),
+            stream,
+        )
+    } else {
+        curl_stream_post(&cfg.codex_responses_url, &headers, body.as_bytes(), stream)
+    };
+
+    match result {
         Ok(status) => record_usage(
             cfg,
             actor,
@@ -1648,6 +1659,89 @@ fn curl_stream_finish(begin: StreamBegin, stream: &mut TcpStream) -> Result<u16,
     Ok(status)
 }
 
+fn curl_stream_finish_responses_as_chat(
+    begin: StreamBegin,
+    stream: &mut TcpStream,
+) -> Result<u16, String> {
+    if !(200..300).contains(&begin.status) {
+        return curl_stream_finish(begin, stream);
+    }
+
+    let StreamBegin {
+        mut child,
+        mut stdout,
+        status,
+        response_headers,
+        body_prefix,
+    } = begin;
+    http::stream_headers(stream, status, &response_headers).map_err(|e| e.to_string())?;
+
+    let mut buffer = String::new();
+    let mut chat_id = format!("chatcmpl-{}", now_secs());
+    let mut model = String::new();
+    let mut created = now_secs().to_string();
+    let mut role_sent = false;
+    let mut finished = false;
+
+    if !body_prefix.is_empty() {
+        buffer.push_str(&String::from_utf8_lossy(&body_prefix));
+        flush_responses_chat_sse_blocks(
+            &mut buffer,
+            stream,
+            &mut chat_id,
+            &mut model,
+            &mut created,
+            &mut role_sent,
+            &mut finished,
+        )?;
+    }
+
+    let mut tmp = [0u8; 8192];
+    loop {
+        let n = stdout.read(&mut tmp).map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
+        }
+        buffer.push_str(&String::from_utf8_lossy(&tmp[..n]));
+        flush_responses_chat_sse_blocks(
+            &mut buffer,
+            stream,
+            &mut chat_id,
+            &mut model,
+            &mut created,
+            &mut role_sent,
+            &mut finished,
+        )?;
+    }
+
+    if !buffer.trim().is_empty() {
+        let block = std::mem::take(&mut buffer);
+        let out = responses_sse_block_to_chat_sse(
+            &block,
+            &mut chat_id,
+            &mut model,
+            &mut created,
+            &mut role_sent,
+            &mut finished,
+        )?;
+        if !out.is_empty() {
+            stream
+                .write_all(out.as_bytes())
+                .map_err(|e| e.to_string())?;
+        }
+    }
+
+    if !finished {
+        let out = finish_chat_sse(&chat_id, &model, &created, &mut role_sent);
+        stream
+            .write_all(out.as_bytes())
+            .map_err(|e| e.to_string())?;
+    }
+    stream.flush().map_err(|e| e.to_string())?;
+    let _ = child.wait();
+    Ok(status)
+}
+
 /// Discard a `StreamBegin` (an out-of-quota response we're failing over from),
 /// returning its body as a ready-to-send JSON string for the error path.
 fn drain_stream_begin(begin: StreamBegin) -> String {
@@ -1683,6 +1777,188 @@ fn curl_stream_post(
 ) -> Result<u16, String> {
     let begin = curl_stream_begin(url, headers, body)?;
     curl_stream_finish(begin, stream)
+}
+
+fn curl_stream_post_responses_as_chat(
+    url: &str,
+    headers: &[(String, String)],
+    body: &[u8],
+    stream: &mut TcpStream,
+) -> Result<u16, String> {
+    let begin = curl_stream_begin(url, headers, body)?;
+    curl_stream_finish_responses_as_chat(begin, stream)
+}
+
+fn flush_responses_chat_sse_blocks(
+    buffer: &mut String,
+    stream: &mut TcpStream,
+    chat_id: &mut String,
+    model: &mut String,
+    created: &mut String,
+    role_sent: &mut bool,
+    finished: &mut bool,
+) -> Result<(), String> {
+    *buffer = buffer.replace("\r\n", "\n");
+    while let Some(pos) = buffer.find("\n\n") {
+        let block = buffer[..pos].to_string();
+        let rest = buffer[pos + 2..].to_string();
+        *buffer = rest;
+        let out =
+            responses_sse_block_to_chat_sse(&block, chat_id, model, created, role_sent, finished)?;
+        if !out.is_empty() {
+            stream
+                .write_all(out.as_bytes())
+                .map_err(|e| e.to_string())?;
+            stream.flush().map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+fn responses_sse_block_to_chat_sse(
+    block: &str,
+    chat_id: &mut String,
+    model: &mut String,
+    created: &mut String,
+    role_sent: &mut bool,
+    finished: &mut bool,
+) -> Result<String, String> {
+    let Some(data) = sse_data(block) else {
+        return Ok(String::new());
+    };
+    if data.trim().is_empty() || data.trim() == "[DONE]" {
+        return Ok(String::new());
+    }
+    let parsed = json::parse(&data)?;
+    update_chat_stream_metadata(&parsed, chat_id, model, created);
+    match parsed.get_str("type").unwrap_or("") {
+        "response.output_text.delta" | "response.refusal.delta" => {
+            let mut out = String::new();
+            if !*role_sent {
+                out.push_str(&chat_role_sse(chat_id, model, created));
+                *role_sent = true;
+            }
+            if let Some(delta) = parsed.get_str("delta")
+                && !delta.is_empty()
+            {
+                let mut delta_obj = Json::object();
+                delta_obj.set("content", Json::String(delta.to_string()));
+                out.push_str(&chat_sse_chunk(
+                    chat_id,
+                    model,
+                    created,
+                    delta_obj,
+                    Json::Null,
+                ));
+            }
+            Ok(out)
+        }
+        "response.completed" => {
+            *finished = true;
+            Ok(finish_chat_sse(chat_id, model, created, role_sent))
+        }
+        "response.incomplete" | "response.failed" => {
+            *finished = true;
+            Ok(finish_chat_sse(chat_id, model, created, role_sent))
+        }
+        _ => Ok(String::new()),
+    }
+}
+
+fn sse_data(block: &str) -> Option<String> {
+    let mut data = Vec::new();
+    for line in block.lines() {
+        let line = line.trim_end_matches('\r');
+        if let Some(rest) = line.strip_prefix("data:") {
+            data.push(rest.trim_start().to_string());
+        }
+    }
+    if data.is_empty() {
+        None
+    } else {
+        Some(data.join("\n"))
+    }
+}
+
+fn update_chat_stream_metadata(
+    event: &Json,
+    chat_id: &mut String,
+    model: &mut String,
+    created: &mut String,
+) {
+    let Some(response) = event.get("response") else {
+        return;
+    };
+    if let Some(id) = response.get_str("id") {
+        *chat_id = if id.starts_with("chatcmpl-") {
+            id.to_string()
+        } else {
+            format!("chatcmpl-{id}")
+        };
+    }
+    if let Some(m) = response.get_str("model") {
+        *model = m.to_string();
+    }
+    if let Some(ts) = json_number_string(response.get("created_at")) {
+        *created = ts;
+    }
+}
+
+fn chat_role_sse(id: &str, model: &str, created: &str) -> String {
+    let mut delta = Json::object();
+    delta.set("role", Json::String("assistant".to_string()));
+    chat_sse_chunk(id, model, created, delta, Json::Null)
+}
+
+fn finish_chat_sse(id: &str, model: &str, created: &str, role_sent: &mut bool) -> String {
+    let mut out = String::new();
+    if !*role_sent {
+        out.push_str(&chat_role_sse(id, model, created));
+        *role_sent = true;
+    }
+    out.push_str(&chat_sse_chunk(
+        id,
+        model,
+        created,
+        Json::object(),
+        Json::String("stop".to_string()),
+    ));
+    out.push_str("data: [DONE]\n\n");
+    out
+}
+
+fn chat_sse_chunk(
+    id: &str,
+    model: &str,
+    created: &str,
+    delta: Json,
+    finish_reason: Json,
+) -> String {
+    let mut chunk = Json::object();
+    chunk.set("id", Json::String(id.to_string()));
+    chunk.set("object", Json::String("chat.completion.chunk".to_string()));
+    chunk.set(
+        "created",
+        Json::Number(if created.is_empty() {
+            now_secs().to_string()
+        } else {
+            created.to_string()
+        }),
+    );
+    chunk.set(
+        "model",
+        Json::String(if model.is_empty() {
+            "codex".to_string()
+        } else {
+            model.to_string()
+        }),
+    );
+    let mut choice = Json::object();
+    choice.set("index", Json::Number("0".to_string()));
+    choice.set("delta", delta);
+    choice.set("finish_reason", finish_reason);
+    chunk.set("choices", Json::Array(vec![choice]));
+    format!("data: {}\n\n", chunk.stringify())
 }
 
 fn transform_request(path: &str, raw: &[u8], cfg: &Config) -> Result<String, String> {
@@ -1731,11 +2007,13 @@ fn chat_to_responses(value: Json, cfg: &Config) -> Result<Json, String> {
         return Err("chat/completions request requires messages[]".to_string());
     };
     for msg in messages {
-        let role = msg
-            .get_str("role")
-            .unwrap_or("user")
-            .replace("system", "developer");
-        let parts = chat_content_to_parts(msg.get("content"));
+        let raw_role = msg.get_str("role").unwrap_or("user");
+        let role = if raw_role == "system" {
+            "developer".to_string()
+        } else {
+            raw_role.to_string()
+        };
+        let parts = chat_content_to_parts_for_role(&role, msg.get("content"));
         let mut item = Json::object();
         item.set("type", Json::String("message".to_string()));
         item.set("role", Json::String(role));
@@ -1750,35 +2028,42 @@ fn chat_to_responses(value: Json, cfg: &Config) -> Result<Json, String> {
 /// parts. Text is preserved as `input_text`; images are forwarded as
 /// `input_image` (previously every non-text part was silently dropped, so the
 /// upstream model never saw screenshots).
-fn chat_content_to_parts(content: Option<&Json>) -> Vec<Json> {
+fn chat_content_to_parts_for_role(role: &str, content: Option<&Json>) -> Vec<Json> {
+    let text_type = if role == "assistant" {
+        "output_text"
+    } else {
+        "input_text"
+    };
     let mut parts = Vec::new();
     match content {
-        Some(Json::String(s)) => parts.push(input_text_part(s)),
+        Some(Json::String(s)) => parts.push(text_part(text_type, s)),
         Some(Json::Array(items)) => {
             for part in items {
                 let kind = part.get_str("type").unwrap_or("");
-                if kind == "image_url" || part.get("image_url").is_some() {
+                if text_type == "input_text"
+                    && (kind == "image_url" || part.get("image_url").is_some())
+                {
                     if let Some(image) = input_image_part(part) {
                         parts.push(image);
                     }
                 } else if let Some(text) = part.get_str("text")
                     && !text.is_empty()
                 {
-                    parts.push(input_text_part(text));
+                    parts.push(text_part(text_type, text));
                 }
             }
         }
         _ => {}
     }
     if parts.is_empty() {
-        parts.push(input_text_part("..."));
+        parts.push(text_part(text_type, "..."));
     }
     parts
 }
 
-fn input_text_part(text: &str) -> Json {
+fn text_part(kind: &str, text: &str) -> Json {
     let mut content = Json::object();
-    content.set("type", Json::String("input_text".to_string()));
+    content.set("type", Json::String(kind.to_string()));
     content.set(
         "text",
         Json::String(if text.is_empty() {
@@ -2684,7 +2969,7 @@ mod tests {
             r#"[{"type":"text","text":"what is this"},{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA","detail":"high"}}]"#,
         )
         .unwrap();
-        let parts = chat_content_to_parts(Some(&content));
+        let parts = chat_content_to_parts_for_role("user", Some(&content));
         assert_eq!(parts.len(), 2);
         assert_eq!(parts[0].get_str("type"), Some("input_text"));
         assert_eq!(parts[0].get_str("text"), Some("what is this"));
@@ -2702,7 +2987,7 @@ mod tests {
             r#"[{"type":"image_url","image_url":{"url":"https://example.com/a.png"}}]"#,
         )
         .unwrap();
-        let parts = chat_content_to_parts(Some(&content));
+        let parts = chat_content_to_parts_for_role("user", Some(&content));
         assert_eq!(parts.len(), 1);
         assert_eq!(parts[0].get_str("type"), Some("input_image"));
         assert_eq!(parts[0].get_str("detail"), Some("auto"));
@@ -2711,7 +2996,7 @@ mod tests {
     #[test]
     fn string_content_is_single_text_part() {
         let content = Json::String("hello".to_string());
-        let parts = chat_content_to_parts(Some(&content));
+        let parts = chat_content_to_parts_for_role("user", Some(&content));
         assert_eq!(parts.len(), 1);
         assert_eq!(parts[0].get_str("type"), Some("input_text"));
         assert_eq!(parts[0].get_str("text"), Some("hello"));
@@ -2719,7 +3004,7 @@ mod tests {
 
     #[test]
     fn empty_content_falls_back_to_placeholder() {
-        let parts = chat_content_to_parts(None);
+        let parts = chat_content_to_parts_for_role("user", None);
         assert_eq!(parts.len(), 1);
         assert_eq!(parts[0].get_str("type"), Some("input_text"));
         assert_eq!(parts[0].get_str("text"), Some("..."));
@@ -2856,6 +3141,99 @@ mod tests {
         let choice = parsed.get("tool_choice").expect("tool choice");
         assert_eq!(choice.get_str("name"), Some("get_weather"));
         assert!(choice.get("function").is_none());
+    }
+
+    #[test]
+    fn codex_chat_history_assistant_content_uses_output_text() {
+        let cfg = test_config("codex-chat-history");
+        ensure_default_files(&cfg).unwrap();
+        let body = transform_request(
+            "/v1/chat/completions",
+            br#"{"model":"codex/gpt-5.4-mini","messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"hello"},{"role":"user","content":"again"}]}"#,
+            &cfg,
+        )
+        .unwrap();
+        let parsed = json::parse(&body).unwrap();
+        let Some(Json::Array(input)) = parsed.get("input") else {
+            panic!("expected input array");
+        };
+        assert_eq!(input[0].get_str("role"), Some("user"));
+        assert_eq!(
+            input[0]
+                .get("content")
+                .and_then(|c| match c {
+                    Json::Array(parts) => parts.first(),
+                    _ => None,
+                })
+                .and_then(|p| p.get_str("type")),
+            Some("input_text")
+        );
+        assert_eq!(input[1].get_str("role"), Some("assistant"));
+        assert_eq!(
+            input[1]
+                .get("content")
+                .and_then(|c| match c {
+                    Json::Array(parts) => parts.first(),
+                    _ => None,
+                })
+                .and_then(|p| p.get_str("type")),
+            Some("output_text")
+        );
+    }
+
+    #[test]
+    fn codex_responses_sse_translates_to_chat_chunks() {
+        let mut id = "chatcmpl-test".to_string();
+        let mut model = String::new();
+        let mut created = "1".to_string();
+        let mut role_sent = false;
+        let mut finished = false;
+
+        let created_event = r#"event: response.created
+data: {"type":"response.created","response":{"id":"resp_123","model":"gpt-5.4-mini","created_at":1782918180}}"#;
+        let delta_event = r#"event: response.output_text.delta
+data: {"type":"response.output_text.delta","delta":"ok"}"#;
+        let completed_event = r#"event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_123","model":"gpt-5.4-mini","created_at":1782918180}}"#;
+
+        assert_eq!(
+            responses_sse_block_to_chat_sse(
+                created_event,
+                &mut id,
+                &mut model,
+                &mut created,
+                &mut role_sent,
+                &mut finished,
+            )
+            .unwrap(),
+            ""
+        );
+        let delta = responses_sse_block_to_chat_sse(
+            delta_event,
+            &mut id,
+            &mut model,
+            &mut created,
+            &mut role_sent,
+            &mut finished,
+        )
+        .unwrap();
+        assert!(delta.contains(r#""object":"chat.completion.chunk""#));
+        assert!(delta.contains(r#""role":"assistant""#));
+        assert!(delta.contains(r#""content":"ok""#));
+        assert!(!delta.contains("response.output_text.delta"));
+
+        let done = responses_sse_block_to_chat_sse(
+            completed_event,
+            &mut id,
+            &mut model,
+            &mut created,
+            &mut role_sent,
+            &mut finished,
+        )
+        .unwrap();
+        assert!(done.contains(r#""finish_reason":"stop""#));
+        assert!(done.contains("data: [DONE]"));
+        assert!(finished);
     }
 
     #[test]
