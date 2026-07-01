@@ -191,7 +191,7 @@ pub fn ensure_default_files(cfg: &Config) -> Result<(), String> {
     let mut models = load_models(cfg);
     let mut models_changed = false;
     let before_legacy_cleanup = models.len();
-    models.retain(|model| !is_legacy_embedding_model(model));
+    models.retain(|model| !is_legacy_embedding_model(model) && !is_unsupported_codex_model(model));
     if models.len() != before_legacy_cleanup {
         models_changed = true;
     }
@@ -218,6 +218,14 @@ fn is_legacy_embedding_model(model: &Model) -> bool {
             || model.upstream_id == "multilingual-e5-small")
 }
 
+fn is_unsupported_codex_model(model: &Model) -> bool {
+    canonical_provider_id(&model.provider_id) == PROVIDER_CODEX
+        && (model.id == "gpt-5.3-codex"
+            || model.id == "gpt-5.3-codex-high"
+            || model.id == "gpt-5.3-codex-low"
+            || model.upstream_id == "gpt-5.3-codex")
+}
+
 pub fn default_models() -> Vec<Model> {
     let mut models = [
         ("gpt-5.5", "GPT 5.5", "gpt-5.5", PROVIDER_CODEX),
@@ -226,24 +234,6 @@ pub fn default_models() -> Vec<Model> {
             "gpt-5.4-mini",
             "GPT 5.4 Mini",
             "gpt-5.4-mini",
-            PROVIDER_CODEX,
-        ),
-        (
-            "gpt-5.3-codex",
-            "GPT 5.3 Codex",
-            "gpt-5.3-codex",
-            PROVIDER_CODEX,
-        ),
-        (
-            "gpt-5.3-codex-high",
-            "GPT 5.3 Codex High",
-            "gpt-5.3-codex",
-            PROVIDER_CODEX,
-        ),
-        (
-            "gpt-5.3-codex-low",
-            "GPT 5.3 Codex Low",
-            "gpt-5.3-codex",
             PROVIDER_CODEX,
         ),
         (
@@ -644,8 +634,8 @@ fn config_bool(value: &str, default: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        Config, DEFAULT_EMBEDDING_MODEL, PROVIDER_EMBEDDINGS, ensure_default_files, load_models,
-        split_keys,
+        Config, DEFAULT_EMBEDDING_MODEL, PROVIDER_CODEX, PROVIDER_EMBEDDINGS, ensure_default_files,
+        load_models, split_keys,
     };
     use std::path::PathBuf;
 
@@ -667,14 +657,14 @@ mod tests {
     }
 
     #[test]
-    fn ensure_default_files_replaces_legacy_embedding_model() {
+    fn ensure_default_files_replaces_legacy_models() {
         let data_dir =
             std::env::temp_dir().join(format!("akurai-router-config-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&data_dir);
         std::fs::create_dir_all(&data_dir).unwrap();
         std::fs::write(
             data_dir.join("models.conf"),
-            "# id|name|upstream_id|provider_id|enabled\nmultilingual-e5-small|Multilingual E5 Small|intfloat/multilingual-e5-small|embeddings|true\n",
+            "# id|name|upstream_id|provider_id|enabled\nmultilingual-e5-small|Multilingual E5 Small|intfloat/multilingual-e5-small|embeddings|true\ngpt-5.3-codex-high|GPT 5.3 Codex High|gpt-5.3-codex|codex|true\n",
         )
         .unwrap();
         let cfg = Config {
@@ -709,10 +699,21 @@ mod tests {
                 .iter()
                 .any(|model| model.id == "multilingual-e5-small")
         );
+        assert!(
+            !models
+                .iter()
+                .any(|model| model.id.starts_with("gpt-5.3-codex")
+                    || model.upstream_id == "gpt-5.3-codex")
+        );
         assert!(models.iter().any(|model| {
             model.id == DEFAULT_EMBEDDING_MODEL
                 && model.upstream_id == DEFAULT_EMBEDDING_MODEL
                 && model.provider_id == PROVIDER_EMBEDDINGS
+        }));
+        assert!(models.iter().any(|model| {
+            model.id == "gpt-5.4-mini"
+                && model.upstream_id == "gpt-5.4-mini"
+                && model.provider_id == PROVIDER_CODEX
         }));
     }
 }

@@ -3080,12 +3080,12 @@ mod tests {
         ensure_default_files(&cfg).unwrap();
         let codex = transform_request(
             "/v1/chat/completions",
-            br#"{"model":"codex/gpt-5.3-codex-high","messages":[{"role":"user","content":"hi"}]}"#,
+            br#"{"model":"codex/gpt-5.4-mini","messages":[{"role":"user","content":"hi"}]}"#,
             &cfg,
         )
         .unwrap();
         let parsed = json::parse(&codex).unwrap();
-        assert_eq!(parsed.get_str("model"), Some("gpt-5.3-codex"));
+        assert_eq!(parsed.get_str("model"), Some("gpt-5.4-mini"));
 
         let opencode = transform_anthropic_messages_request(
             br#"{"model":"opencode-go/qwen3.7-plus","messages":[{"role":"user","content":"hi"}]}"#,
