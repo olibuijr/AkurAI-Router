@@ -8,8 +8,8 @@ pub const PROVIDER_CODEX: &str = "codex";
 pub const PROVIDER_CLAUDE: &str = "claude";
 pub const PROVIDER_OPENCODE_GO: &str = "opencode-go";
 pub const PROVIDER_EMBEDDINGS: &str = "embeddings";
-pub const DEFAULT_EMBEDDING_MODEL: &str = "intfloat/multilingual-e5-small";
-pub const DEFAULT_EMBEDDING_UPSTREAM_URL: &str = "http://127.0.0.1:8081/v1/embeddings";
+pub const DEFAULT_EMBEDDING_MODEL: &str = "embeddinggemma";
+pub const DEFAULT_EMBEDDING_UPSTREAM_URL: &str = "http://100.88.0.2:8081/v1/embeddings";
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -190,6 +190,11 @@ pub fn ensure_default_files(cfg: &Config) -> Result<(), String> {
     let models_path = cfg.data_dir.join("models.conf");
     let mut models = load_models(cfg);
     let mut models_changed = false;
+    let before_legacy_cleanup = models.len();
+    models.retain(|model| !is_legacy_embedding_model(model));
+    if models.len() != before_legacy_cleanup {
+        models_changed = true;
+    }
     for default_model in default_models() {
         if !models.iter().any(|m| m.id == default_model.id) {
             models.push(default_model);
@@ -204,6 +209,13 @@ pub fn ensure_default_files(cfg: &Config) -> Result<(), String> {
         save_embedding_config(cfg, &load_embedding_config(cfg))?;
     }
     Ok(())
+}
+
+fn is_legacy_embedding_model(model: &Model) -> bool {
+    canonical_provider_id(&model.provider_id) == PROVIDER_EMBEDDINGS
+        && (model.id == "multilingual-e5-small"
+            || model.upstream_id == "intfloat/multilingual-e5-small"
+            || model.upstream_id == "multilingual-e5-small")
 }
 
 pub fn default_models() -> Vec<Model> {
@@ -283,8 +295,8 @@ pub fn default_models() -> Vec<Model> {
             PROVIDER_CLAUDE,
         ),
         (
-            "multilingual-e5-small",
-            "Multilingual E5 Small",
+            "embeddinggemma",
+            "EmbeddingGemma",
             DEFAULT_EMBEDDING_MODEL,
             PROVIDER_EMBEDDINGS,
         ),
@@ -496,6 +508,7 @@ pub fn write_local_env_template(cfg: &Config) -> Result<PathBuf, String> {
 
 pub fn infer_model_provider_id(model_id: &str) -> String {
     if model_id == DEFAULT_EMBEDDING_MODEL
+        || model_id == "embeddinggemma"
         || model_id.starts_with("multilingual-e5")
         || model_id.starts_with("intfloat/")
     {
@@ -630,7 +643,11 @@ fn config_bool(value: &str, default: bool) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::split_keys;
+    use super::{
+        Config, DEFAULT_EMBEDDING_MODEL, PROVIDER_EMBEDDINGS, ensure_default_files, load_models,
+        split_keys,
+    };
+    use std::path::PathBuf;
 
     #[test]
     fn split_keys_dedupes_and_trims() {
@@ -647,5 +664,55 @@ mod tests {
     #[test]
     fn split_keys_single() {
         assert_eq!(split_keys("sk-only"), vec!["sk-only"]);
+    }
+
+    #[test]
+    fn ensure_default_files_replaces_legacy_embedding_model() {
+        let data_dir =
+            std::env::temp_dir().join(format!("akurai-router-config-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&data_dir);
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::write(
+            data_dir.join("models.conf"),
+            "# id|name|upstream_id|provider_id|enabled\nmultilingual-e5-small|Multilingual E5 Small|intfloat/multilingual-e5-small|embeddings|true\n",
+        )
+        .unwrap();
+        let cfg = Config {
+            listen_addr: "127.0.0.1:0".to_string(),
+            public_base_url: "http://127.0.0.1:0".to_string(),
+            data_dir: data_dir.clone(),
+            api_key: "akr_test".to_string(),
+            codex_auth_path: PathBuf::from("/tmp/codex-auth.json"),
+            codex_responses_url: "https://example.com/codex".to_string(),
+            codex_models_url: "https://example.com/codex-models".to_string(),
+            claude_auth_path: PathBuf::from("/tmp/claude-auth.json"),
+            claude_messages_url: "https://example.com/claude".to_string(),
+            claude_models_url: "https://example.com/claude-models".to_string(),
+            opencode_go_auth_path: PathBuf::from("/tmp/opencode-auth.json"),
+            opencode_go_chat_url: "https://example.com/opencode-chat".to_string(),
+            opencode_go_messages_url: "https://example.com/opencode-messages".to_string(),
+            opencode_go_models_url: "https://example.com/opencode-models".to_string(),
+            opencode_go_keys: Vec::new(),
+            opencode_go_cooldown_secs: 300,
+            default_model: "gpt-5.4-mini".to_string(),
+            idp_issuer: "https://auth.example.com".to_string(),
+            idp_client_id: "client".to_string(),
+            idp_client_secret: "secret".to_string(),
+            admin_allowed_email: "user@example.com".to_string(),
+            cookie_secret: "012345678901234567890123456789".to_string(),
+        };
+
+        ensure_default_files(&cfg).unwrap();
+        let models = load_models(&cfg);
+        assert!(
+            !models
+                .iter()
+                .any(|model| model.id == "multilingual-e5-small")
+        );
+        assert!(models.iter().any(|model| {
+            model.id == DEFAULT_EMBEDDING_MODEL
+                && model.upstream_id == DEFAULT_EMBEDDING_MODEL
+                && model.provider_id == PROVIDER_EMBEDDINGS
+        }));
     }
 }

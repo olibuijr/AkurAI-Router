@@ -575,6 +575,51 @@ fn responses_tools_to_chat(tools: &[Json]) -> Vec<Json> {
     out
 }
 
+/// Convert chat-completions function tools
+/// (`{type:"function",function:{name,description,parameters}}`) into the
+/// Responses API shape (`{type:"function",name,description,parameters}`).
+/// Already-flat Responses tools and built-in tool types are passed through.
+fn chat_tools_to_responses(tools: &[Json]) -> Vec<Json> {
+    let mut out = Vec::new();
+    for tool in tools {
+        let Some(function) = tool.get("function") else {
+            out.push(tool.clone());
+            continue;
+        };
+        let Some(name) = function.get_str("name") else {
+            out.push(tool.clone());
+            continue;
+        };
+        let mut converted = Json::object();
+        converted.set("type", Json::String("function".to_string()));
+        converted.set("name", Json::String(name.to_string()));
+        if let Some(desc) = function.get_str("description") {
+            converted.set("description", Json::String(desc.to_string()));
+        }
+        if let Some(params) = function.get("parameters") {
+            converted.set("parameters", params.clone());
+        }
+        if let Some(Json::Bool(strict)) = function.get("strict").or_else(|| tool.get("strict")) {
+            converted.set("strict", Json::Bool(*strict));
+        }
+        out.push(converted);
+    }
+    out
+}
+
+fn chat_tool_choice_to_responses(choice: &Json) -> Json {
+    let Some(function) = choice.get("function") else {
+        return choice.clone();
+    };
+    let Some(name) = function.get_str("name") else {
+        return choice.clone();
+    };
+    let mut converted = Json::object();
+    converted.set("type", Json::String("function".to_string()));
+    converted.set("name", Json::String(name.to_string()));
+    converted
+}
+
 /// Translate an OpenAI Responses request into an equivalent chat/completions
 /// request. When `force_tool_for_schema` is set and the request asks for a
 /// `json_schema` structured output, the schema is bridged to a forced
@@ -626,10 +671,16 @@ fn responses_to_chat(
                     }
                     "function_call" => {
                         let mut call = Json::object();
-                        call.set("id", Json::String(item.get_str("call_id").unwrap_or("").to_string()));
+                        call.set(
+                            "id",
+                            Json::String(item.get_str("call_id").unwrap_or("").to_string()),
+                        );
                         call.set("type", Json::String("function".to_string()));
                         let mut func = Json::object();
-                        func.set("name", Json::String(item.get_str("name").unwrap_or("").to_string()));
+                        func.set(
+                            "name",
+                            Json::String(item.get_str("name").unwrap_or("").to_string()),
+                        );
                         func.set(
                             "arguments",
                             Json::String(item.get_str("arguments").unwrap_or("{}").to_string()),
@@ -714,7 +765,10 @@ fn responses_to_chat(
                     );
                     messages.push(sys);
                 } else {
-                    let name = format.get_str("name").unwrap_or("structured_output").to_string();
+                    let name = format
+                        .get_str("name")
+                        .unwrap_or("structured_output")
+                        .to_string();
                     let strict = format.get_bool("strict").unwrap_or(true);
                     let mut rf = Json::object();
                     rf.set("type", Json::String("json_schema".to_string()));
@@ -791,16 +845,28 @@ fn chat_completion_to_responses(chat: &Json, structured_tool: Option<&str>) -> J
                 let func = call.get("function");
                 let mut item = Json::object();
                 item.set("type", Json::String("function_call".to_string()));
-                item.set("id", Json::String(call.get_str("id").unwrap_or("").to_string()));
-                item.set("call_id", Json::String(call.get_str("id").unwrap_or("").to_string()));
+                item.set(
+                    "id",
+                    Json::String(call.get_str("id").unwrap_or("").to_string()),
+                );
+                item.set(
+                    "call_id",
+                    Json::String(call.get_str("id").unwrap_or("").to_string()),
+                );
                 item.set(
                     "name",
-                    Json::String(func.and_then(|f| f.get_str("name")).unwrap_or("").to_string()),
+                    Json::String(
+                        func.and_then(|f| f.get_str("name"))
+                            .unwrap_or("")
+                            .to_string(),
+                    ),
                 );
                 item.set(
                     "arguments",
                     Json::String(
-                        func.and_then(|f| f.get_str("arguments")).unwrap_or("{}").to_string(),
+                        func.and_then(|f| f.get_str("arguments"))
+                            .unwrap_or("{}")
+                            .to_string(),
                     ),
                 );
                 item.set("status", Json::String("completed".to_string()));
@@ -960,7 +1026,9 @@ fn forward_opencode_go_responses(
         let _ = http::send_json(
             stream,
             400,
-            &error_json("this opencode-go model does not support /v1/responses; use /v1/chat/completions"),
+            &error_json(
+                "this opencode-go model does not support /v1/responses; use /v1/chat/completions",
+            ),
         );
         return;
     }
@@ -1014,7 +1082,12 @@ fn forward_opencode_go_responses(
             };
             let resp = chat_completion_to_responses(&chat_json, structured_tool.as_deref());
             if wants_stream {
-                let _ = http::send_text(stream, 200, "text/event-stream", &responses_object_to_sse(&resp));
+                let _ = http::send_text(
+                    stream,
+                    200,
+                    "text/event-stream",
+                    &responses_object_to_sse(&resp),
+                );
             } else {
                 let _ = http::send_json(stream, 200, &resp.stringify());
             }
@@ -1091,7 +1164,13 @@ fn forward_claude_responses(
         .iter()
         .map(|(k, v)| (k.as_str(), v.clone()))
         .collect();
-    match curl_capture("POST", &cfg.claude_messages_url, &headers_ref, body.as_bytes(), 900) {
+    match curl_capture(
+        "POST",
+        &cfg.claude_messages_url,
+        &headers_ref,
+        body.as_bytes(),
+        900,
+    ) {
         Ok(resp) => {
             let text = String::from_utf8_lossy(&resp.body);
             record_usage(
@@ -1132,7 +1211,15 @@ fn forward_claude_responses(
             }
         }
         Err(e) => {
-            record_usage(cfg, actor, PROVIDER_CLAUDE, &requested_model, &req.path, 502, None);
+            record_usage(
+                cfg,
+                actor,
+                PROVIDER_CLAUDE,
+                &requested_model,
+                &req.path,
+                502,
+                None,
+            );
             let _ = http::send_json(stream, 502, &error_json(&e));
         }
     }
@@ -1627,11 +1714,13 @@ fn chat_to_responses(value: Json, cfg: &Config) -> Result<Json, String> {
     if let Some(stream) = value.get_bool("stream") {
         out.set("stream", Json::Bool(stream));
     }
-    if let Some(v) = value.get("tools") {
+    if let Some(Json::Array(tools)) = value.get("tools") {
+        out.set("tools", Json::Array(chat_tools_to_responses(tools)));
+    } else if let Some(v) = value.get("tools") {
         out.set("tools", v.clone());
     }
     if let Some(v) = value.get("tool_choice") {
-        out.set("tool_choice", v.clone());
+        out.set("tool_choice", chat_tool_choice_to_responses(v));
     }
     if let Some(v) = value.get("reasoning_effort") {
         out.set("reasoning_effort", v.clone());
@@ -1743,6 +1832,7 @@ fn normalize_codex_body(body: &mut Json, cfg: &Config) -> Result<(), String> {
     }
     normalize_input(body);
     normalize_reasoning(body);
+    normalize_codex_tools(body);
     for key in [
         "temperature",
         "top_p",
@@ -1782,6 +1872,15 @@ fn normalize_codex_body(body: &mut Json, cfg: &Config) -> Result<(), String> {
         items.retain(|(k, _)| allowed.contains(&k.as_str()));
     }
     Ok(())
+}
+
+fn normalize_codex_tools(body: &mut Json) {
+    if let Some(Json::Array(tools)) = body.get("tools") {
+        body.set("tools", Json::Array(chat_tools_to_responses(tools)));
+    }
+    if let Some(choice) = body.get("tool_choice") {
+        body.set("tool_choice", chat_tool_choice_to_responses(choice));
+    }
 }
 
 fn transform_claude_request(raw: &[u8], cfg: &Config) -> Result<String, String> {
@@ -2642,7 +2741,7 @@ mod tests {
         assert!(ids.contains(&"claude/claude-opus-4-8"));
         assert!(ids.contains(&"opencode-go/glm-5.2"));
         assert!(ids.contains(&"opencode-go/qwen3.7-plus"));
-        assert!(ids.contains(&"embeddings/multilingual-e5-small"));
+        assert!(ids.contains(&"embeddings/embeddinggemma"));
     }
 
     #[test]
@@ -2666,7 +2765,7 @@ mod tests {
             PROVIDER_OPENCODE_GO
         );
         assert_eq!(
-            provider_for_model(&cfg, "embeddings/multilingual-e5-small"),
+            provider_for_model(&cfg, "embeddings/embeddinggemma"),
             PROVIDER_EMBEDDINGS
         );
     }
@@ -2681,7 +2780,7 @@ mod tests {
             crate::config::DEFAULT_EMBEDDING_MODEL.to_string()
         );
         assert_eq!(
-            resolve_embedding_model(&cfg, &embedding, "embeddings/multilingual-e5-small"),
+            resolve_embedding_model(&cfg, &embedding, "embeddings/embeddinggemma"),
             crate::config::DEFAULT_EMBEDDING_MODEL
         );
         assert_eq!(
@@ -2712,6 +2811,51 @@ mod tests {
         .unwrap();
         let parsed = json::parse(&opencode).unwrap();
         assert_eq!(parsed.get_str("model"), Some("qwen3.7-plus"));
+    }
+
+    #[test]
+    fn codex_chat_tools_normalize_to_responses_shape() {
+        let cfg = test_config("codex-chat-tools");
+        ensure_default_files(&cfg).unwrap();
+        let body = transform_request(
+            "/v1/chat/completions",
+            br#"{"model":"codex/gpt-5.4-mini","messages":[{"role":"user","content":"weather"}],"tools":[{"type":"function","function":{"name":"get_weather","description":"Get weather","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}],"tool_choice":{"type":"function","function":{"name":"get_weather"}}}"#,
+            &cfg,
+        )
+        .unwrap();
+        let parsed = json::parse(&body).unwrap();
+        let Some(Json::Array(tools)) = parsed.get("tools") else {
+            panic!("expected tools array");
+        };
+        assert_eq!(tools[0].get_str("type"), Some("function"));
+        assert_eq!(tools[0].get_str("name"), Some("get_weather"));
+        assert!(tools[0].get("function").is_none());
+        assert!(tools[0].get("parameters").is_some());
+        let choice = parsed.get("tool_choice").expect("tool choice");
+        assert_eq!(choice.get_str("type"), Some("function"));
+        assert_eq!(choice.get_str("name"), Some("get_weather"));
+        assert!(choice.get("function").is_none());
+    }
+
+    #[test]
+    fn codex_responses_tools_normalize_chat_style_shape() {
+        let cfg = test_config("codex-responses-tools");
+        ensure_default_files(&cfg).unwrap();
+        let body = transform_request(
+            "/v1/responses",
+            br#"{"model":"codex/gpt-5.4-mini","input":"weather","tools":[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object"}}}],"tool_choice":{"type":"function","function":{"name":"get_weather"}}}"#,
+            &cfg,
+        )
+        .unwrap();
+        let parsed = json::parse(&body).unwrap();
+        let Some(Json::Array(tools)) = parsed.get("tools") else {
+            panic!("expected tools array");
+        };
+        assert_eq!(tools[0].get_str("name"), Some("get_weather"));
+        assert!(tools[0].get("function").is_none());
+        let choice = parsed.get("tool_choice").expect("tool choice");
+        assert_eq!(choice.get_str("name"), Some("get_weather"));
+        assert!(choice.get("function").is_none());
     }
 
     #[test]
@@ -2836,12 +2980,14 @@ mod tests {
         assert_eq!(resp.get_str("status"), Some("completed"));
         assert_eq!(resp.get_str("output_text"), Some(r#"{"a":"b"}"#));
         assert_eq!(
-            resp.get("usage").and_then(|u| u.get_str("input_tokens")).or_else(|| resp
-                .get("usage")
-                .and_then(|u| match u.get("input_tokens") {
-                    Some(Json::Number(n)) => Some(n.as_str()),
-                    _ => None,
-                })),
+            resp.get("usage")
+                .and_then(|u| u.get_str("input_tokens"))
+                .or_else(
+                    || resp.get("usage").and_then(|u| match u.get("input_tokens") {
+                        Some(Json::Number(n)) => Some(n.as_str()),
+                        _ => None,
+                    })
+                ),
             Some("5")
         );
     }

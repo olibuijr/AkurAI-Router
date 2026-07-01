@@ -36,7 +36,7 @@ LOGIN_STATUS=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 "https://${
 EMBED_STATUS=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 \
   -X POST "http://127.0.0.1:${PORT}/v1/embeddings" \
   -H "Content-Type: application/json" \
-  -d '{"input":"test","model":"intfloat/multilingual-e5-small"}' 2>/dev/null)
+  -d '{"input":"test","model":"embeddinggemma"}' 2>/dev/null)
 [ "$EMBED_STATUS" = "200" ] || [ "$EMBED_STATUS" = "401" ] || [ "$EMBED_STATUS" = "400" ] && pass_ "/v1/embeddings reachable (${EMBED_STATUS})" || fail_ "/v1/embeddings → ${EMBED_STATUS}"
 
 # 6. Env file

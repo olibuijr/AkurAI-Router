@@ -8,6 +8,8 @@ HOST="${AKURAI_ROUTER_DEPLOY_HOST:-akurai-mail}"
 REMOTE_BIN="/usr/local/bin/akurai-router"
 SERVICE="akurai-router.service"
 PORT="${AKURAI_ROUTER_PORT:-4219}"
+EMBEDDINGS_URL="${AKURAI_ROUTER_EMBEDDINGS_URL:-http://100.88.0.2:8081/v1/embeddings}"
+EMBEDDINGS_MODEL="${AKURAI_ROUTER_EMBEDDINGS_MODEL:-embeddinggemma}"
 
 CC_x86_64_unknown_linux_musl="${CC_x86_64_unknown_linux_musl:-musl-gcc}" \
   cargo build --release --target "$TARGET"
@@ -28,8 +30,8 @@ AKURAI_ROUTER_CODEX_AUTH_PATH=/home/ubuntu/.codex/auth.json
 AKURAI_ROUTER_CLAUDE_AUTH_PATH=/home/ubuntu/.claude/.credentials.json
 AKURAI_ROUTER_OPENCODE_GO_AUTH_PATH=/home/ubuntu/.local/share/opencode/auth.json
 AKURAI_ROUTER_DEFAULT_MODEL=gpt-5.4-mini
-AKURAI_ROUTER_EMBEDDINGS_URL=http://127.0.0.1:8081/v1/embeddings
-AKURAI_ROUTER_EMBEDDINGS_MODEL=intfloat/multilingual-e5-small
+AKURAI_ROUTER_EMBEDDINGS_URL=$EMBEDDINGS_URL
+AKURAI_ROUTER_EMBEDDINGS_MODEL=$EMBEDDINGS_MODEL
 AKURAI_ROUTER_EMBEDDINGS_ENABLED=true
 AKURAI_ROUTER_IDP_ISSUER=https://auth.olibuijr.com
 AKURAI_ROUTER_IDP_CLIENT_ID=
@@ -45,14 +47,27 @@ ssh "$HOST" "if ! sudo grep -q '^AKURAI_ROUTER_OPENCODE_GO_AUTH_PATH=' /etc/akur
 fi"
 
 ssh "$HOST" "if ! sudo grep -q '^AKURAI_ROUTER_EMBEDDINGS_URL=' /etc/akurai-router/router.env; then
-  echo 'AKURAI_ROUTER_EMBEDDINGS_URL=http://127.0.0.1:8081/v1/embeddings' | sudo tee -a /etc/akurai-router/router.env >/dev/null
+  echo 'AKURAI_ROUTER_EMBEDDINGS_URL=$EMBEDDINGS_URL' | sudo tee -a /etc/akurai-router/router.env >/dev/null
+else
+  sudo sed -i 's#^AKURAI_ROUTER_EMBEDDINGS_URL=.*#AKURAI_ROUTER_EMBEDDINGS_URL=$EMBEDDINGS_URL#' /etc/akurai-router/router.env
 fi
 if ! sudo grep -q '^AKURAI_ROUTER_EMBEDDINGS_MODEL=' /etc/akurai-router/router.env; then
-  echo 'AKURAI_ROUTER_EMBEDDINGS_MODEL=intfloat/multilingual-e5-small' | sudo tee -a /etc/akurai-router/router.env >/dev/null
+  echo 'AKURAI_ROUTER_EMBEDDINGS_MODEL=$EMBEDDINGS_MODEL' | sudo tee -a /etc/akurai-router/router.env >/dev/null
+else
+  sudo sed -i 's#^AKURAI_ROUTER_EMBEDDINGS_MODEL=.*#AKURAI_ROUTER_EMBEDDINGS_MODEL=$EMBEDDINGS_MODEL#' /etc/akurai-router/router.env
 fi
 if ! sudo grep -q '^AKURAI_ROUTER_EMBEDDINGS_ENABLED=' /etc/akurai-router/router.env; then
   echo 'AKURAI_ROUTER_EMBEDDINGS_ENABLED=true' | sudo tee -a /etc/akurai-router/router.env >/dev/null
-fi"
+else
+  sudo sed -i 's#^AKURAI_ROUTER_EMBEDDINGS_ENABLED=.*#AKURAI_ROUTER_EMBEDDINGS_ENABLED=true#' /etc/akurai-router/router.env
+fi
+sudo tee /var/lib/akurai-router/embeddings.conf >/dev/null <<EOF
+AKURAI_ROUTER_EMBEDDINGS_ENABLED=true
+AKURAI_ROUTER_EMBEDDINGS_URL=$EMBEDDINGS_URL
+AKURAI_ROUTER_EMBEDDINGS_MODEL=$EMBEDDINGS_MODEL
+EOF
+sudo chown ubuntu:ubuntu /var/lib/akurai-router/embeddings.conf
+sudo chmod 0600 /var/lib/akurai-router/embeddings.conf"
 
 ssh "$HOST" "sudo tee /etc/systemd/system/$SERVICE >/dev/null <<'EOF'
 [Unit]

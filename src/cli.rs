@@ -309,8 +309,8 @@ Environment:
   AKURAI_ROUTER_CLAUDE_AUTH_PATH=/home/olafurbui/.claude/.credentials.json
   AKURAI_ROUTER_OPENCODE_GO_AUTH_PATH=/home/olafurbui/.local/share/opencode/auth.json
   AKURAI_ROUTER_IDP_ISSUER=https://auth.olibuijr.com
-  AKURAI_ROUTER_EMBEDDINGS_URL=http://127.0.0.1:8081/v1/embeddings
-  AKURAI_ROUTER_EMBEDDINGS_MODEL=intfloat/multilingual-e5-small
+  AKURAI_ROUTER_EMBEDDINGS_URL=http://100.88.0.2:8081/v1/embeddings
+  AKURAI_ROUTER_EMBEDDINGS_MODEL=embeddinggemma
   AKURAI_ROUTER_EMBEDDINGS_ENABLED=true
   AKURAI_ROUTER_IDP_CLIENT_ID=...
   AKURAI_ROUTER_IDP_CLIENT_SECRET=...
